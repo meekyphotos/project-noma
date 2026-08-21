@@ -5,7 +5,10 @@ members = [
     "crates/noma-hotkey",
     "crates/noma-audio",
     "crates/noma-asr",
+    "crates/noma-config",
     "crates/noma-inject",
+    "crates/noma-model",
+    "crates/noma-text",
     "crates/noma-hud",
 ]
 
@@ -19,17 +22,32 @@ description = "Local push-to-talk dictation for Windows and macOS"
 [workspace.dependencies]
 anyhow = "1"
 arboard = "3"
+bzip2 = "0.4"
 cpal = "0.15"
+dirs = "5"
 eframe = "0.32"
 egui = "0.32"
 enigo = "0.3"
 noma-asr = { path = "crates/noma-asr" }
 noma-audio = { path = "crates/noma-audio" }
+noma-config = { path = "crates/noma-config" }
 noma-hotkey = { path = "crates/noma-hotkey" }
 noma-hud = { path = "crates/noma-hud" }
 noma-inject = { path = "crates/noma-inject" }
+noma-model = { path = "crates/noma-model" }
+noma-text = { path = "crates/noma-text" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sherpa-rs = { version = "0.6", default-features = false, features = ["download-binaries"] }
+tar = "0.4"
+toml = "0.8"
 tray-icon = "0.21"
+ureq = "2"
 
 [profile.release]
 lto = "thin"
 codegen-units = 1
+
+# The model download and first decode are unbearable in a debug build.
+[profile.dev.package."*"]
+opt-level = 2

@@ -6,6 +6,15 @@ license.workspace = true
 repository.workspace = true
 description = "Speech-to-text engine trait for Noma"
 
+[features]
+default = []
+# Both need a CUDA / DirectML capable sherpa-onnx, which is built from source
+# rather than downloaded. See the README before turning either on.
+cuda = ["sherpa-rs/cuda"]
+directml = ["sherpa-rs/directml"]
+
 [dependencies]
 anyhow.workspace = true
 noma-audio.workspace = true
+noma-model.workspace = true
+sherpa-rs.workspace = true

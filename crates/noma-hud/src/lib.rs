@@ -1,29 +1,36 @@
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::Receiver;
 use std::sync::{Arc, Mutex};
-use std::thread;
 use std::time::{Duration, Instant};
 
-use anyhow::{Context, Result};
+use anyhow::{Context as _, Result};
 use eframe::egui::{
     self, Color32, CornerRadius, Pos2, Rect, Stroke, StrokeKind, ViewportBuilder, ViewportCommand,
 };
-use noma_asr::AsrEngine;
+use noma_asr::{EngineSlot, EngineStatus};
 use noma_audio::Recorder;
+use noma_config::{History, Settings};
 use noma_hotkey::PttEvent;
 use tray_icon::menu::{Menu, MenuEvent, MenuItem, PredefinedMenuItem};
 use tray_icon::{Icon, TrayIcon, TrayIconBuilder};
 
-mod mascot;
+mod history_window;
+mod session;
+
+use session::Session;
 
 const HUD_WIDTH: f32 = 380.0;
 const HUD_HEIGHT: f32 = 64.0;
-const PEAK_BINS: usize = 22;
+pub(crate) const PEAK_BINS: usize = 22;
 const PARKED: Pos2 = Pos2::new(-4000.0, -4000.0);
+/// Roughly how many characters of partial text fit on the subtitle line.
+const SUBTITLE_CHARS: usize = 46;
 
 #[derive(Clone, Debug)]
 pub enum Phase {
     Idle,
+    /// The model is still being fetched or opened.
+    Loading { message: String, percent: f32 },
     Listening,
     Transcribing,
     Error(String),
@@ -32,40 +39,50 @@ pub enum Phase {
 pub struct UiState {
     pub phase: Phase,
     pub peaks: Vec<f32>,
+    /// Text decoded so far, while the key is still held.
+    pub partial: String,
+    /// The last thing pasted, for the tray's copy action.
+    pub last: String,
+}
+
+impl Default for UiState {
+    fn default() -> Self {
+        Self {
+            phase: Phase::Idle,
+            peaks: vec![0.0; PEAK_BINS],
+            partial: String::new(),
+            last: String::new(),
+        }
+    }
 }
 
 pub struct HudConfig {
     pub ptt_rx: Receiver<PttEvent>,
     pub recorder: Recorder,
-    pub asr: Arc<dyn AsrEngine>,
-}
-
-struct Session {
-    ui: Arc<Mutex<UiState>>,
-    recorder: Recorder,
-    asr: Arc<dyn AsrEngine>,
-    wakeup: Arc<Mutex<Option<egui::Context>>>,
-    capturing: AtomicBool,
-    busy: AtomicBool,
+    /// The engine, which may still be loading.
+    pub engine: EngineSlot,
+    pub settings: Settings,
+    pub history: History,
 }
 
 pub fn run(config: HudConfig) -> Result<()> {
-    let ui = Arc::new(Mutex::new(UiState {
-        phase: Phase::Idle,
-        peaks: vec![0.0; PEAK_BINS],
-    }));
+    let ui = Arc::new(Mutex::new(UiState::default()));
     let wakeup = Arc::new(Mutex::new(None::<egui::Context>));
-    let session = Arc::new(Session {
-        ui: Arc::clone(&ui),
-        recorder: config.recorder.clone(),
-        asr: Arc::clone(&config.asr),
-        wakeup: Arc::clone(&wakeup),
-        capturing: AtomicBool::new(false),
-        busy: AtomicBool::new(false),
-    });
-    spawn_session(Arc::clone(&session), config.ptt_rx);
+    let settings = Arc::new(config.settings);
+    let hud_alpha = settings.hud_alpha();
+    let history = Arc::new(Mutex::new(config.history));
 
-    let (tray, preview_item, quit_item) = build_tray().context("create tray icon")?;
+    let session = Session::new(
+        Arc::clone(&ui),
+        config.recorder.clone(),
+        config.engine.clone(),
+        Arc::clone(&settings),
+        Arc::clone(&history),
+        Arc::clone(&wakeup),
+    );
+    session::spawn(Arc::clone(&session), config.ptt_rx);
+
+    let tray = Tray::build().context("create tray icon")?;
 
     let options = eframe::NativeOptions {
         viewport: ViewportBuilder::default()
@@ -85,6 +102,7 @@ pub fn run(config: HudConfig) -> Result<()> {
     };
 
     let recorder = config.recorder;
+    let engine = config.engine;
     eframe::run_native(
         "noma",
         options,
@@ -93,116 +111,84 @@ pub fn run(config: HudConfig) -> Result<()> {
             Ok(Box::new(HudApp {
                 ui,
                 recorder,
+                engine,
+                hud_alpha,
+                history,
                 wakeup,
                 tray,
-                preview_item,
-                quit_item,
+                show_history: Arc::new(AtomicBool::new(false)),
                 preview_until: None,
                 error_until: None,
                 last_shown: None,
-                mascot: mascot::Mascot::new(),
+                engine_settled: false,
             }))
         }),
     )
     .map_err(|err| anyhow::anyhow!("hud event loop: {err}"))
 }
 
-fn spawn_session(session: Arc<Session>, ptt_rx: Receiver<PttEvent>) {
-    thread::Builder::new()
-        .name("noma-session".into())
-        .spawn(move || {
-            while let Ok(event) = ptt_rx.recv() {
-                match event {
-                    PttEvent::Pressed => session_press(&session),
-                    PttEvent::Released => session_release(&session),
-                }
-            }
+/// The tray icon and the menu items we need to compare events against.
+struct Tray {
+    #[allow(dead_code)]
+    icon: TrayIcon,
+    preview: MenuItem,
+    history: MenuItem,
+    copy_last: MenuItem,
+    open_folder: MenuItem,
+    quit: MenuItem,
+}
+
+impl Tray {
+    fn build() -> Result<Tray> {
+        let preview = MenuItem::new("Preview HUD", true, None);
+        let history = MenuItem::new("History...", true, None);
+        let copy_last = MenuItem::new("Copy last transcript", true, None);
+        let open_folder = MenuItem::new("Open settings folder", true, None);
+        let quit = MenuItem::new("Quit", true, None);
+
+        let menu = Menu::new();
+        menu.append(&preview).context("tray preview item")?;
+        menu.append(&history).context("tray history item")?;
+        menu.append(&copy_last).context("tray copy item")?;
+        menu.append(&PredefinedMenuItem::separator())
+            .context("tray separator")?;
+        menu.append(&open_folder).context("tray folder item")?;
+        menu.append(&quit).context("tray quit item")?;
+
+        let icon = TrayIconBuilder::new()
+            .with_tooltip(format!("Noma - hold {} to talk", noma_hotkey::key_label()))
+            .with_icon(tray_icon_image())
+            .with_menu(Box::new(menu))
+            .build()
+            .context("build tray icon")?;
+
+        Ok(Tray {
+            icon,
+            preview,
+            history,
+            copy_last,
+            open_folder,
+            quit,
         })
-        .expect("spawn session thread");
-}
-
-fn session_press(session: &Session) {
-    if session.busy.load(Ordering::SeqCst) {
-        return;
-    }
-    match session.recorder.start() {
-        Ok(()) => {
-            session.capturing.store(true, Ordering::SeqCst);
-            let mut state = session.ui.lock().expect("ui state");
-            state.phase = Phase::Listening;
-            state.peaks = vec![0.0; PEAK_BINS];
-            eprintln!("noma: listening");
-        }
-        Err(err) => {
-            let mut state = session.ui.lock().expect("ui state");
-            state.phase = Phase::Error(format!("mic: {err:#}"));
-            eprintln!("noma: mic start failed: {err:#}");
-        }
-    }
-    wake(session);
-}
-
-fn session_release(session: &Arc<Session>) {
-    if !session.capturing.swap(false, Ordering::SeqCst) {
-        return;
-    }
-    let clip = match session.recorder.stop() {
-        Ok(clip) => clip,
-        Err(err) => {
-            session.ui.lock().expect("ui state").phase = Phase::Error(format!("mic stop: {err:#}"));
-            wake(session);
-            return;
-        }
-    };
-
-    session.busy.store(true, Ordering::SeqCst);
-    session.ui.lock().expect("ui state").phase = Phase::Transcribing;
-    wake(session);
-    eprintln!("noma: transcribing {:.1}s", clip.duration_secs());
-
-    let session = Arc::clone(session);
-    thread::spawn(move || {
-        noma_hotkey::wait_until_released(Duration::from_millis(400));
-        let result = session
-            .asr
-            .transcribe(&clip)
-            .and_then(|transcript| noma_inject::paste_text(&transcript.text).map(|_| transcript));
-        {
-            let mut state = session.ui.lock().expect("ui state");
-            match result {
-                Ok(transcript) => {
-                    eprintln!("noma: pasted {}", transcript.text);
-                    state.phase = Phase::Idle;
-                }
-                Err(err) => {
-                    eprintln!("noma: paste/transcribe failed: {err:#}");
-                    state.phase = Phase::Error(err.to_string());
-                }
-            }
-        }
-        session.busy.store(false, Ordering::SeqCst);
-        wake(&session);
-    });
-}
-
-fn wake(session: &Session) {
-    if let Some(ctx) = session.wakeup.lock().expect("wakeup").as_ref() {
-        ctx.request_repaint();
     }
 }
 
 struct HudApp {
     ui: Arc<Mutex<UiState>>,
     recorder: Recorder,
+    engine: EngineSlot,
+    /// Pill opacity, resolved from settings at startup.
+    hud_alpha: u8,
+    history: Arc<Mutex<History>>,
     wakeup: Arc<Mutex<Option<egui::Context>>>,
-    #[allow(dead_code)]
-    tray: TrayIcon,
-    preview_item: MenuItem,
-    quit_item: MenuItem,
+    tray: Tray,
+    /// Shared with the history window so it can close itself.
+    show_history: Arc<AtomicBool>,
     preview_until: Option<Instant>,
     error_until: Option<Instant>,
     last_shown: Option<bool>,
-    mascot: mascot::Mascot,
+    /// True once the engine has reported ready or failed at least once.
+    engine_settled: bool,
 }
 
 impl eframe::App for HudApp {
@@ -213,12 +199,13 @@ impl eframe::App for HudApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         *self.wakeup.lock().expect("wakeup") = Some(ctx.clone());
         self.poll_menu(ctx);
+        self.sync_engine();
         self.tick_timers();
         self.sync_peaks(ctx);
 
         let snapshot = {
             let state = self.ui.lock().expect("ui state");
-            (state.phase.clone(), state.peaks.clone())
+            (state.phase.clone(), state.peaks.clone(), state.partial.clone())
         };
 
         let show = !matches!(snapshot.0, Phase::Idle);
@@ -226,8 +213,11 @@ impl eframe::App for HudApp {
             self.last_shown = Some(show);
         }
 
-        paint_hud(ctx, &snapshot.0, &snapshot.1);
-        self.mascot.show(ctx, &snapshot.0);
+        paint_hud(ctx, &snapshot.0, &snapshot.1, &snapshot.2, self.hud_alpha);
+
+        if self.show_history.load(Ordering::SeqCst) {
+            history_window::show(ctx, &self.history, &self.show_history);
+        }
 
         ctx.request_repaint_after(if show {
             Duration::from_millis(16)
@@ -240,13 +230,56 @@ impl eframe::App for HudApp {
 impl HudApp {
     fn poll_menu(&mut self, ctx: &egui::Context) {
         while let Ok(event) = MenuEvent::receiver().try_recv() {
-            if event.id == self.quit_item.id() {
+            if event.id == self.tray.quit.id() {
                 ctx.send_viewport_cmd(ViewportCommand::Close);
-            } else if event.id == self.preview_item.id() {
+            } else if event.id == self.tray.preview.id() {
                 self.preview_until = Some(Instant::now() + Duration::from_secs(3));
                 let mut state = self.ui.lock().expect("ui state");
                 if matches!(state.phase, Phase::Idle | Phase::Error(_)) {
                     state.phase = Phase::Listening;
+                }
+            } else if event.id == self.tray.history.id() {
+                self.show_history.store(true, Ordering::SeqCst);
+                ctx.request_repaint();
+            } else if event.id == self.tray.copy_last.id() {
+                let last = self.ui.lock().expect("ui state").last.clone();
+                if last.is_empty() {
+                    eprintln!("noma: nothing dictated yet");
+                } else {
+                    ctx.copy_text(last);
+                }
+            } else if event.id == self.tray.open_folder.id() {
+                open_settings_folder();
+            }
+        }
+    }
+
+    /// Mirror the engine's loading state into the HUD.
+    ///
+    /// Downloading Parakeet takes minutes, and a first run with no feedback
+    /// looks exactly like a broken install.
+    fn sync_engine(&mut self) {
+        let status = self.engine.status();
+        let mut state = self.ui.lock().expect("ui state");
+        // Never interrupt a dictation that is already under way.
+        if matches!(state.phase, Phase::Listening | Phase::Transcribing) {
+            return;
+        }
+        match status {
+            EngineStatus::Loading { message, percent } => {
+                state.phase = Phase::Loading { message, percent };
+            }
+            EngineStatus::Ready(label) => {
+                if !self.engine_settled {
+                    self.engine_settled = true;
+                    eprintln!("noma: {label} ready");
+                    state.phase = Phase::Idle;
+                }
+            }
+            EngineStatus::Failed(reason) => {
+                if !self.engine_settled {
+                    self.engine_settled = true;
+                    state.phase = Phase::Error(reason);
                 }
             }
         }
@@ -315,6 +348,21 @@ impl HudApp {
     }
 }
 
+/// Ask the shell to open the folder holding `settings.toml`.
+fn open_settings_folder() {
+    let Ok(dir) = noma_config::config_dir() else {
+        return;
+    };
+    let _ = std::fs::create_dir_all(&dir);
+    #[cfg(windows)]
+    let opened = std::process::Command::new("explorer").arg(&dir).spawn();
+    #[cfg(not(windows))]
+    let opened = std::process::Command::new("xdg-open").arg(&dir).spawn();
+    if let Err(err) = opened {
+        eprintln!("noma: could not open {}: {err}", dir.display());
+    }
+}
+
 #[cfg(windows)]
 fn place_hud(show: bool) -> bool {
     use windows::Win32::Foundation::RECT;
@@ -326,7 +374,7 @@ fn place_hud(show: bool) -> bool {
     let Some(hwnd) = find_noma_hwnd() else {
         return false;
     };
-    glass_hwnd(hwnd);
+    clear_dwm_backdrop(hwnd);
 
     unsafe {
         if show {
@@ -358,10 +406,6 @@ fn place_hud(show: bool) -> bool {
                 0,
                 SWP_NOSIZE | SWP_NOACTIVATE | SWP_SHOWWINDOW,
             );
-            eprintln!(
-                "noma: HUD show hwnd={hwnd:?} work=({},{},{},{}) pos=({x},{y}) size=({width}x{height})",
-                work.left, work.top, work.right, work.bottom
-            );
         } else {
             let _ = SetWindowPos(
                 hwnd,
@@ -377,14 +421,28 @@ fn place_hud(show: bool) -> bool {
     true
 }
 
+/// Stop DWM painting anything of its own behind the HUD.
+///
+/// `with_transparent(true)` makes winit mark the client area DWM-transparent,
+/// and that is exactly the condition that lets a system backdrop paint
+/// *underneath* it. Asking for acrylic here did not add glass over the desktop,
+/// it replaced the desktop with a slab of material. Worse, the HUD is created
+/// inactive and every `SetWindowPos` passes `SWP_NOACTIVATE`, and Windows
+/// degrades acrylic on a deactivated window to a flat solid colour - so the
+/// slab did not even blur.
+///
+/// The pill paints its own translucency, so DWM only has to stay out of the way.
 #[cfg(windows)]
-fn glass_hwnd(hwnd: windows::Win32::Foundation::HWND) {
+fn clear_dwm_backdrop(hwnd: windows::Win32::Foundation::HWND) {
     use windows::Win32::Graphics::Dwm::{
-        DwmSetWindowAttribute, DWMSBT_TRANSIENTWINDOW, DWMWA_SYSTEMBACKDROP_TYPE,
-        DWMWA_WINDOW_CORNER_PREFERENCE, DWMWCP_ROUND,
+        DwmSetWindowAttribute, DWMSBT_NONE, DWMWA_SYSTEMBACKDROP_TYPE,
+        DWMWA_WINDOW_CORNER_PREFERENCE, DWMWCP_DONOTROUND,
     };
-    let preference = DWMWCP_ROUND;
-    let backdrop = DWMSBT_TRANSIENTWINDOW;
+    // The window is a bare rounded rectangle we draw ourselves; DWM rounding
+    // would only clip pixels that are already transparent, and can leave a
+    // hairline border on a borderless window.
+    let preference = DWMWCP_DONOTROUND;
+    let backdrop = DWMSBT_NONE;
     let _ = unsafe {
         DwmSetWindowAttribute(
             hwnd,
@@ -433,6 +491,7 @@ fn find_noma_hwnd() -> Option<windows::Win32::Foundation::HWND> {
             return true.into();
         }
         let title = String::from_utf16_lossy(&buf[..len as usize]);
+        // Exactly "Noma": the history window must not be moved off-screen.
         if title == "Noma" {
             search.hwnd = hwnd;
             return false.into();
@@ -458,17 +517,19 @@ fn place_hud(_show: bool) -> bool {
     true
 }
 
-fn paint_hud(ctx: &egui::Context, phase: &Phase, peaks: &[f32]) {
+fn paint_hud(ctx: &egui::Context, phase: &Phase, peaks: &[f32], partial: &str, alpha: u8) {
     egui::CentralPanel::default()
         .frame(egui::Frame::NONE)
         .show(ctx, |ui| {
             let rect = ui.max_rect();
             let painter = ui.painter();
             let radius = (rect.height() * 0.5) as u8;
+            // The only thing between the text and the desktop: DWM paints no
+            // backdrop behind this window, by design.
             painter.rect_filled(
                 rect,
                 CornerRadius::same(radius),
-                Color32::from_rgba_unmultiplied(18, 24, 36, 150),
+                Color32::from_rgba_unmultiplied(18, 24, 36, alpha),
             );
             painter.rect_stroke(
                 rect,
@@ -478,17 +539,22 @@ fn paint_hud(ctx: &egui::Context, phase: &Phase, peaks: &[f32]) {
             );
 
             let (title, accent) = match phase {
+                Phase::Loading { .. } => ("Setting up", Color32::from_rgb(196, 181, 253)),
                 Phase::Listening => ("Listening", Color32::from_rgb(52, 211, 190)),
                 Phase::Transcribing => ("Transcribing", Color32::from_rgb(125, 211, 252)),
                 Phase::Error(_) => ("Error", Color32::from_rgb(248, 113, 113)),
                 Phase::Idle => ("Noma", Color32::from_rgb(148, 163, 184)),
             };
 
+            // While the key is held, the words matter more than the hint.
             let subtitle = match phase {
-                Phase::Error(message) => message.as_str(),
-                Phase::Listening => noma_hotkey::PTT_KEY_NAME,
-                Phase::Transcribing => "Almost done",
-                Phase::Idle => "Hold Right Ctrl",
+                Phase::Error(message) => tail(message, SUBTITLE_CHARS),
+                Phase::Loading { message, .. } => tail(message, SUBTITLE_CHARS),
+                Phase::Listening if !partial.is_empty() => tail(partial, SUBTITLE_CHARS),
+                Phase::Listening => noma_hotkey::key_label().to_string(),
+                Phase::Transcribing if !partial.is_empty() => tail(partial, SUBTITLE_CHARS),
+                Phase::Transcribing => "Almost done".to_string(),
+                Phase::Idle => format!("Hold {}", noma_hotkey::key_label()),
             };
 
             let dot = Pos2::new(rect.left() + 22.0, rect.center().y);
@@ -505,17 +571,55 @@ fn paint_hud(ctx: &egui::Context, phase: &Phase, peaks: &[f32]) {
             painter.text(
                 Pos2::new(rect.left() + 36.0, rect.center().y + 10.0),
                 egui::Align2::LEFT_CENTER,
-                subtitle,
+                &subtitle,
                 egui::FontId::proportional(11.0),
                 Color32::from_rgb(148, 163, 184),
             );
 
-            let wave = Rect::from_min_max(
+            let right = Rect::from_min_max(
                 Pos2::new(rect.left() + 158.0, rect.top() + 16.0),
                 Pos2::new(rect.right() - 22.0, rect.bottom() - 16.0),
             );
-            paint_waveform(painter, wave, peaks, accent);
+            match phase {
+                Phase::Loading { percent, .. } => paint_progress(painter, right, *percent, accent),
+                _ => paint_waveform(painter, right, peaks, accent),
+            }
         });
+}
+
+/// The end of a long line, which is where the newest words are.
+fn tail(text: &str, max_chars: usize) -> String {
+    let count = text.chars().count();
+    if count <= max_chars {
+        return text.to_string();
+    }
+    let skip = count - max_chars + 1;
+    format!("...{}", text.chars().skip(skip).collect::<String>())
+}
+
+fn paint_progress(painter: &egui::Painter, rect: Rect, percent: f32, color: Color32) {
+    let height = 6.0;
+    let track = Rect::from_min_max(
+        Pos2::new(rect.left(), rect.center().y - height * 0.5),
+        Pos2::new(rect.right(), rect.center().y + height * 0.5),
+    );
+    let radius = (height * 0.5) as u8;
+    painter.rect_filled(
+        track,
+        CornerRadius::same(radius),
+        Color32::from_rgba_unmultiplied(255, 255, 255, 26),
+    );
+    let filled = track.width() * (percent / 100.0).clamp(0.0, 1.0);
+    if filled > 0.5 {
+        painter.rect_filled(
+            Rect::from_min_max(
+                track.min,
+                Pos2::new(track.left() + filled.max(height), track.max.y),
+            ),
+            CornerRadius::same(radius),
+            color,
+        );
+    }
 }
 
 fn paint_waveform(painter: &egui::Painter, rect: Rect, peaks: &[f32], color: Color32) {
@@ -535,25 +639,6 @@ fn paint_waveform(painter: &egui::Painter, rect: Rect, peaks: &[f32], color: Col
         let bar = Rect::from_min_max(Pos2::new(x, mid_y - h), Pos2::new(x + bar_w, mid_y + h));
         painter.rect_filled(bar, CornerRadius::same(radius), color);
     }
-}
-
-fn build_tray() -> Result<(TrayIcon, MenuItem, MenuItem)> {
-    let preview = MenuItem::new("Preview HUD", true, None);
-    let quit = MenuItem::new("Quit", true, None);
-    let menu = Menu::new();
-    menu.append(&preview).context("tray preview item")?;
-    menu.append(&PredefinedMenuItem::separator())
-        .context("tray separator")?;
-    menu.append(&quit).context("tray quit item")?;
-
-    let tray = TrayIconBuilder::new()
-        .with_tooltip("Noma — hold Right Ctrl to talk")
-        .with_icon(tray_icon_image())
-        .with_menu(Box::new(menu))
-        .build()
-        .context("build tray icon")?;
-
-    Ok((tray, preview, quit))
 }
 
 fn tray_icon_image() -> Icon {
@@ -576,4 +661,30 @@ fn tray_icon_image() -> Icon {
         }
     }
     Icon::from_rgba(rgba, size, size).expect("tray rgba icon")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn short_subtitles_are_left_alone() {
+        assert_eq!(tail("Hold Right Ctrl", 46), "Hold Right Ctrl");
+    }
+
+    #[test]
+    fn long_subtitles_keep_the_newest_words() {
+        let text = "one two three four five six seven eight nine ten eleven twelve";
+        let shown = tail(text, 20);
+        assert_eq!(shown.chars().count(), 20 + 2);
+        assert!(shown.starts_with("..."));
+        assert!(text.ends_with(shown.trim_start_matches('.')));
+    }
+
+    #[test]
+    fn truncation_counts_characters_not_bytes() {
+        let text = "aéîöu".repeat(20);
+        let shown = tail(&text, 10);
+        assert_eq!(shown.chars().count(), 12);
+    }
 }

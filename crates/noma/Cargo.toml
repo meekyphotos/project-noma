@@ -10,9 +10,16 @@ description = "Noma push-to-talk dictation app"
 name = "noma"
 path = "src/main.rs"
 
+[features]
+default = []
+cuda = ["noma-asr/cuda"]
+directml = ["noma-asr/directml"]
+
 [dependencies]
 anyhow.workspace = true
 noma-asr.workspace = true
 noma-audio.workspace = true
+noma-config.workspace = true
 noma-hotkey.workspace = true
 noma-hud.workspace = true
+noma-model.workspace = true

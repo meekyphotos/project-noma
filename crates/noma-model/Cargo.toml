@@ -1,0 +1,14 @@
+[package]
+name = "noma-model"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Model registry and first-run download for Noma"
+
+[dependencies]
+anyhow.workspace = true
+bzip2.workspace = true
+dirs.workspace = true
+tar.workspace = true
+ureq.workspace = true
