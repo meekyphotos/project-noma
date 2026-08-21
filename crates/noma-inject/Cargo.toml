@@ -1,0 +1,12 @@
+[package]
+name = "noma-inject"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Paste transcribed text into the focused app"
+
+[dependencies]
+anyhow.workspace = true
+arboard.workspace = true
+enigo.workspace = true

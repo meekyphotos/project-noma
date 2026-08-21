@@ -1,0 +1,24 @@
+[package]
+name = "noma-hud"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Transparent waveform overlay for Noma"
+
+[dependencies]
+anyhow.workspace = true
+eframe.workspace = true
+egui.workspace = true
+noma-asr.workspace = true
+noma-audio.workspace = true
+noma-hotkey.workspace = true
+noma-inject.workspace = true
+tray-icon.workspace = true
+
+[target.'cfg(windows)'.dependencies]
+windows = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_Graphics_Gdi",
+    "Win32_UI_WindowsAndMessaging",
+] }

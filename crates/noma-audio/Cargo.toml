@@ -1,0 +1,11 @@
+[package]
+name = "noma-audio"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Microphone capture and waveform peaks for Noma"
+
+[dependencies]
+anyhow.workspace = true
+cpal.workspace = true

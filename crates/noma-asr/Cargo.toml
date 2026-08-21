@@ -1,0 +1,11 @@
+[package]
+name = "noma-asr"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Speech-to-text engine trait for Noma"
+
+[dependencies]
+anyhow.workspace = true
+noma-audio.workspace = true

@@ -1,0 +1,18 @@
+[package]
+name = "noma"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Noma push-to-talk dictation app"
+
+[[bin]]
+name = "noma"
+path = "src/main.rs"
+
+[dependencies]
+anyhow.workspace = true
+noma-asr.workspace = true
+noma-audio.workspace = true
+noma-hotkey.workspace = true
+noma-hud.workspace = true

@@ -1,0 +1,35 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/noma",
+    "crates/noma-hotkey",
+    "crates/noma-audio",
+    "crates/noma-asr",
+    "crates/noma-inject",
+    "crates/noma-hud",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+repository = "https://github.com/meekyphotos/project-noma"
+description = "Local push-to-talk dictation for Windows and macOS"
+
+[workspace.dependencies]
+anyhow = "1"
+arboard = "3"
+cpal = "0.15"
+eframe = "0.32"
+egui = "0.32"
+enigo = "0.3"
+noma-asr = { path = "crates/noma-asr" }
+noma-audio = { path = "crates/noma-audio" }
+noma-hotkey = { path = "crates/noma-hotkey" }
+noma-hud = { path = "crates/noma-hud" }
+noma-inject = { path = "crates/noma-inject" }
+tray-icon = "0.21"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
