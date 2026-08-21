@@ -4,6 +4,19 @@ Local push-to-talk dictation. Hold a hotkey, speak, release, and text is pasted 
 
 Transcription is NVIDIA Parakeet TDT 0.6B, running locally through [sherpa-onnx](https://github.com/k2-fsa/sherpa-onnx).
 
+## Download
+
+Grab the newest build from the [releases page](https://github.com/meekyphotos/project-noma/releases),
+unzip it anywhere, and run `noma.exe`. Nothing needs installing: the sherpa-onnx
+and ONNX Runtime libraries and the Visual C++ runtime all ship inside the zip.
+The Parakeet model (~465 MB) is fetched on first launch.
+
+| Build | What it is |
+|---|---|
+| A `v*` release | A fixed version that never changes |
+| `nightly` | The newest commit on `main`, rebuilt on every push |
+| An Actions artifact | The build for one specific commit, kept 30 days |
+
 ## Run (Windows)
 
 ```bash
@@ -193,6 +206,36 @@ cargo test -p noma-audio --test capture -- --ignored --nocapture
 
 Two examples help when dictation records nothing: `devices` lists the mics and
 marks the one Noma would use, and `levels` measures what each one is hearing.
+
+## Releasing
+
+`.github/workflows/build.yml` builds on Windows for every push and pull request,
+runs the test suite, and packages `noma.exe` with its DLLs.
+
+Pushing to `main` refreshes the rolling `nightly` prerelease in place, so that
+download URL always points at the head of the branch. A build is also attached
+to every run as an artifact, including for pull requests.
+
+To cut a real version, bump `version` in the workspace `Cargo.toml`, commit,
+then tag it:
+
+```bash
+git tag v0.2.0 && git push origin v0.2.0
+```
+
+The workflow refuses to publish if the tag disagrees with the version in
+`Cargo.toml`, so the two cannot drift apart.
+
+Two details the packaging step guards, because both produce a build that looks
+fine and fails on the user's machine:
+
+- `noma.exe` links `sherpa-onnx-c-api.dll`, so a bare executable cannot start.
+  The DLLs are placed by a build script that only runs when cargo re-runs it,
+  which a restored cache can skip. The step recovers them from the download
+  cache and fails the build if any are still missing.
+- `onnxruntime.dll` imports the Visual C++ runtime, which a clean Windows
+  install does not have. It is bundled app-local so the zip has no
+  prerequisites.
 
 ## Next
 

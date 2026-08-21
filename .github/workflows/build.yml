@@ -1,0 +1,228 @@
+name: build
+
+# Three lanes, so every commit is downloadable without drowning the repo in
+# releases:
+#   every run    -> an Actions artifact attached to that run
+#   push to main -> the rolling "nightly" prerelease, one permanent URL
+#   a v* tag     -> a real, permanent versioned release
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+  workflow_dispatch:
+
+# The repository default is read-only, so releases need this granted explicitly
+# or `gh release` fails with "Resource not accessible by integration".
+permissions:
+  contents: read
+
+concurrency:
+  group: build-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref == 'refs/heads/main' }}
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: "0"
+  CARGO_NET_RETRY: "10"
+  RUSTUP_MAX_RETRIES: "10"
+
+jobs:
+  build:
+    name: x86_64-pc-windows-msvc
+    # Pinned rather than windows-latest: a future flip of that alias must not
+    # silently change what a release was built against.
+    runs-on: windows-2025
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v7
+
+      # sherpa-rs-sys runs bindgen, and the published crate ships no
+      # pre-generated bindings.rs. LLVM is on the image but LIBCLANG_PATH is
+      # not set, so clang-sys only finds it by a fallback search. Pin it, and
+      # fail loudly if a future image drops LLVM instead of failing deep inside
+      # a build script.
+      - name: Locate libclang
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $candidates = @("C:\Program Files\LLVM\bin")
+          $clang = Get-Command clang.exe -ErrorAction SilentlyContinue
+          if ($clang) { $candidates += (Split-Path $clang.Source) }
+          $hit = $candidates | Where-Object { Test-Path (Join-Path $_ 'libclang.dll') } | Select-Object -First 1
+          if (-not $hit) { throw "libclang.dll not found on this runner image; bindgen would fail" }
+          "LIBCLANG_PATH=$hit" | Out-File $env:GITHUB_ENV -Append -Encoding utf8
+          Write-Host "libclang: $hit"
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          # Bump when the sherpa-onnx version changes.
+          key: sherpa-1.12.9
+          # sherpa-rs-sys downloads its prebuilt libraries into the user cache
+          # directory, which is neither ~/.cargo nor target/, so rust-cache
+          # would otherwise refetch ~180 MB on every run.
+          cache-directories: |
+            ~\AppData\Local\sherpa-rs
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+
+      - name: Test
+        run: cargo test --workspace --locked
+        # The end-to-end Parakeet and microphone suites are #[ignore]d: one
+        # needs a 465 MB model download, the other needs a real input device.
+
+      - name: Build
+        run: cargo build --release --locked -p noma
+
+      - name: Derive version
+        id: meta
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $cargoVersion = (cargo metadata --format-version 1 --no-deps | ConvertFrom-Json).packages |
+            Where-Object { $_.name -eq 'noma' } | Select-Object -ExpandProperty version
+          $short = $env:GITHUB_SHA.Substring(0, 7)
+
+          if ($env:GITHUB_REF -like 'refs/tags/v*') {
+            $tag = $env:GITHUB_REF_NAME
+            # A tag that disagrees with Cargo.toml would ship a binary whose
+            # reported version is a lie. Catch it before publishing.
+            if ($tag.Substring(1) -ne $cargoVersion) {
+              Write-Host "::error::tag $tag does not match the noma version $cargoVersion in Cargo.toml"
+              exit 1
+            }
+            $channel = 'stable'
+            $version = $cargoVersion
+            $stem    = "noma-v$version-x86_64-pc-windows-msvc"
+          } else {
+            $channel = 'nightly'
+            $version = "$cargoVersion+$short"
+            # A fixed name keeps /releases/download/nightly/<file> working.
+            $stem    = 'noma-nightly-x86_64-pc-windows-msvc'
+          }
+
+          "channel=$channel" | Out-File $env:GITHUB_OUTPUT -Append -Encoding utf8
+          "version=$version" | Out-File $env:GITHUB_OUTPUT -Append -Encoding utf8
+          "stem=$stem"       | Out-File $env:GITHUB_OUTPUT -Append -Encoding utf8
+          Write-Host "$channel $version -> $stem.zip"
+
+      - name: Package
+        id: package
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $stem  = '${{ steps.meta.outputs.stem }}'
+          $stage = Join-Path $env:RUNNER_TEMP $stem
+          New-Item -ItemType Directory -Force -Path $stage | Out-Null
+
+          Copy-Item target\release\noma.exe $stage
+
+          # Windows resolves imports from the executable's own directory, so
+          # every DLL sits flat beside noma.exe - no bin/ or lib/ subfolder.
+          Copy-Item target\release\*.dll $stage -ErrorAction SilentlyContinue
+
+          # sherpa-rs-sys copies these next to the binary, but only when cargo
+          # actually re-runs its build script, and only `if !dst.exists()`. A
+          # restored cache can leave the build fingerprint-fresh while the DLLs
+          # were pruned from target/, which produces a green build and an exe
+          # that cannot start. Recover them from the download cache, then
+          # assert, rather than trusting the build script.
+          $required = @(
+            'sherpa-onnx-c-api.dll', 'sherpa-onnx-cxx-api.dll',
+            'onnxruntime.dll', 'onnxruntime_providers_shared.dll', 'cargs.dll'
+          )
+          $missing = $required | Where-Object { -not (Test-Path (Join-Path $stage $_)) }
+          if ($missing) {
+            Write-Host "not in target\release, recovering from the sherpa-rs cache: $($missing -join ', ')"
+            $cached = Get-ChildItem "$env:LOCALAPPDATA\sherpa-rs" -Recurse -Filter *.dll -ErrorAction SilentlyContinue
+            foreach ($dll in $missing) {
+              $found = $cached | Where-Object { $_.Name -eq $dll } | Select-Object -First 1
+              if ($found) { Copy-Item $found.FullName $stage }
+            }
+          }
+          $missing = $required | Where-Object { -not (Test-Path (Join-Path $stage $_)) }
+          if ($missing) { throw "runtime DLLs missing, the zip would not start: $($missing -join ', ')" }
+
+          # onnxruntime.dll imports MSVCP140 and VCRUNTIME140, which a clean
+          # Windows install does not have. Ship the runtime app-local so the
+          # zip has no prerequisites; otherwise it fails before main() with a
+          # missing-DLL dialog that says nothing about Noma.
+          $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
+          $vsPath = & $vswhere -latest -products * -property installationPath
+          if (-not $vsPath) { throw 'vswhere found no Visual Studio installation' }
+          $crt = Get-ChildItem "$vsPath\VC\Redist\MSVC\*\x64\Microsoft.VC*.CRT" -Directory |
+                 Sort-Object FullName -Descending | Select-Object -First 1
+          if (-not $crt) { throw "no VC redistributable found under $vsPath" }
+          Copy-Item "$($crt.FullName)\*.dll" $stage
+          foreach ($dll in 'vcruntime140.dll', 'msvcp140.dll') {
+            if (-not (Test-Path (Join-Path $stage $dll))) { throw "VC runtime missing: $dll" }
+          }
+          Write-Host "bundled the VC runtime from $($crt.FullName)"
+
+          Copy-Item README.md $stage
+          if (Test-Path LICENSE) { Copy-Item LICENSE $stage }
+
+          $zip = Join-Path $env:RUNNER_TEMP "$stem.zip"
+          Compress-Archive -Path $stage -DestinationPath $zip -CompressionLevel Optimal
+          (Get-FileHash $zip -Algorithm SHA256).Hash.ToLower() + "  $stem.zip" |
+            Out-File "$zip.sha256" -Encoding ascii
+
+          "zip=$zip" | Out-File $env:GITHUB_OUTPUT -Append -Encoding utf8
+          "sha=$zip.sha256" | Out-File $env:GITHUB_OUTPUT -Append -Encoding utf8
+          Get-ChildItem $stage | Select-Object Name, Length | Format-Table -AutoSize
+          Write-Host "zip: $([math]::Round((Get-Item $zip).Length / 1MB, 1)) MB"
+
+      # Lane 1: every run, including pull requests, gets a downloadable build.
+      - uses: actions/upload-artifact@v7
+        with:
+          name: ${{ steps.meta.outputs.stem }}
+          path: ${{ steps.package.outputs.zip }}
+          retention-days: 30
+          if-no-files-found: error
+
+      # Lane 2: one rolling prerelease that always points at the head of main.
+      # Deleted and recreated rather than updated, because a release's tag
+      # cannot be moved in place.
+      - name: Update the nightly release
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $ErrorActionPreference = 'Continue'
+          gh release delete nightly --yes --cleanup-tag 2>$null
+          $ErrorActionPreference = 'Stop'
+          $notes = @"
+          Automatic build of the latest commit on ``main``.
+
+          Commit: ${{ github.sha }}
+          Version: ${{ steps.meta.outputs.version }}
+
+          Unzip anywhere and run ``noma.exe``. The Parakeet model (~465 MB) is
+          downloaded on first launch. This link always points at the newest
+          commit, so it changes without warning - use a tagged release if you
+          want a build that stays put.
+          "@
+          gh release create nightly `
+            --target ${{ github.sha }} `
+            --title "nightly (${{ steps.meta.outputs.version }})" `
+            --notes $notes `
+            --prerelease `
+            --latest=false `
+            "${{ steps.package.outputs.zip }}" "${{ steps.package.outputs.sha }}"
+
+      # Lane 3: a real release, created only for a v* tag.
+      - name: Publish the tagged release
+        if: startsWith(github.ref, 'refs/tags/v')
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          gh release create ${{ github.ref_name }} `
+            --title "Noma ${{ github.ref_name }}" `
+            --generate-notes `
+            --latest `
+            "${{ steps.package.outputs.zip }}" "${{ steps.package.outputs.sha }}"
