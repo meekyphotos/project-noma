@@ -9,7 +9,7 @@ use crate::Phase;
 const MASCOT_SIZE: i32 = 157;
 const SRC: usize = 256;
 const FRAME: usize = SRC * SRC * 4;
-const FPS: f64 = 12.0;
+const FPS: f64 = 8.0;
 
 static HWND_BITS: AtomicIsize = AtomicIsize::new(0);
 static DRAGGING: AtomicBool = AtomicBool::new(false);
@@ -129,7 +129,7 @@ fn load_clip_file(file: &str) -> Option<Clip> {
     if bytes.len() < FRAME {
         return None;
     }
-    punch_white(&mut bytes);
+    punch_green(&mut bytes);
     let count = bytes.len() / FRAME;
     let mut frames = Vec::with_capacity(count);
     for i in 0..count {
@@ -144,7 +144,7 @@ fn load_frame_file(file: &str) -> Option<Vec<u8>> {
         return None;
     }
     bytes.truncate(FRAME);
-    punch_white(&mut bytes);
+    punch_green(&mut bytes);
     Some(bytes)
 }
 
@@ -158,25 +158,14 @@ fn asset_path(file: &str) -> PathBuf {
     .unwrap_or_else(|| PathBuf::from("assets/mascot").join(file))
 }
 
-/// Only punch near-pure white studio backdrop. Specular highlights stay.
-fn punch_white(bytes: &mut [u8]) {
+/// Punch leftover chroma green. Noma is purple/cyan, so green is safe.
+fn punch_green(bytes: &mut [u8]) {
     for px in bytes.chunks_exact_mut(4) {
         let r = px[0];
         let g = px[1];
         let b = px[2];
-        let a = px[3];
-        if a == 0 {
-            continue;
-        }
-        let max = r.max(g).max(b);
-        let min = r.min(g).min(b);
-        let dist = 255u16.saturating_sub(min as u16)
-            + 255u16.saturating_sub(g as u16)
-            + 255u16.saturating_sub(b as u16);
-        if max >= 252 && min >= 248 && max.saturating_sub(min) <= 4 {
+        if g > 160 && g > r.saturating_add(40) && g > b.saturating_add(40) {
             px[3] = 0;
-        } else if min >= 238 && max.saturating_sub(min) <= 8 && dist < 30 {
-            px[3] = ((dist * 8).min(255)) as u8;
         }
     }
 }
