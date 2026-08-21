@@ -14,9 +14,9 @@ use noma_hotkey::PttEvent;
 use tray_icon::menu::{Menu, MenuEvent, MenuItem, PredefinedMenuItem};
 use tray_icon::{Icon, TrayIcon, TrayIconBuilder};
 
-const HUD_WIDTH: f32 = 320.0;
-const HUD_HEIGHT: f32 = 72.0;
-const PEAK_BINS: usize = 48;
+const HUD_WIDTH: f32 = 380.0;
+const HUD_HEIGHT: f32 = 64.0;
+const PEAK_BINS: usize = 22;
 const PARKED: Pos2 = Pos2::new(-4000.0, -4000.0);
 
 #[derive(Clone, Debug)]
@@ -71,7 +71,7 @@ pub fn run(config: HudConfig) -> Result<()> {
             .with_inner_size([HUD_WIDTH, HUD_HEIGHT])
             .with_position(PARKED)
             .with_decorations(false)
-            .with_transparent(false)
+            .with_transparent(true)
             .with_always_on_top()
             .with_taskbar(false)
             .with_resizable(false)
@@ -203,7 +203,7 @@ struct HudApp {
 
 impl eframe::App for HudApp {
     fn clear_color(&self, _visuals: &egui::Visuals) -> [f32; 4] {
-        [10.0 / 255.0, 14.0 / 255.0, 20.0 / 255.0, 1.0]
+        [0.0, 0.0, 0.0, 0.0]
     }
 
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
@@ -285,12 +285,25 @@ impl HudApp {
                     .collect();
             }
             Phase::Listening => {
-                state.peaks = self.recorder.peaks();
+                let t = ctx.input(|i| i.time);
+                let live = self.recorder.peaks();
+                state.peaks = (0..PEAK_BINS)
+                    .map(|i| {
+                        let sample = live.get(i).copied().unwrap_or(0.0).powf(0.65) * 1.7;
+                        let idle = 0.08 + 0.06 * ((t * 3.2 + i as f64 * 0.45).sin().abs() as f32);
+                        sample.max(idle)
+                    })
+                    .collect();
             }
             Phase::Transcribing => {
                 let t = ctx.input(|i| i.time);
-                let pulse = 0.12 + 0.12 * ((t * 4.0).sin().abs() as f32);
-                state.peaks = vec![pulse; PEAK_BINS];
+                state.peaks = (0..PEAK_BINS)
+                    .map(|i| {
+                        let x = i as f64 / (PEAK_BINS.max(1) as f64);
+                        let traveling = ((x * std::f64::consts::TAU * 1.2) - t * 7.0).sin();
+                        0.12 + 0.55 * ((traveling * 0.5 + 0.5) as f32)
+                    })
+                    .collect();
             }
             _ => {}
         }
@@ -308,6 +321,7 @@ fn place_hud(show: bool) -> bool {
     let Some(hwnd) = find_noma_hwnd() else {
         return false;
     };
+    round_hwnd(hwnd);
 
     unsafe {
         if show {
@@ -356,6 +370,22 @@ fn place_hud(show: bool) -> bool {
         }
     }
     true
+}
+
+#[cfg(windows)]
+fn round_hwnd(hwnd: windows::Win32::Foundation::HWND) {
+    use windows::Win32::Graphics::Dwm::{
+        DwmSetWindowAttribute, DWMWA_WINDOW_CORNER_PREFERENCE, DWMWCP_ROUND,
+    };
+    let preference = DWMWCP_ROUND;
+    let _ = unsafe {
+        DwmSetWindowAttribute(
+            hwnd,
+            DWMWA_WINDOW_CORNER_PREFERENCE,
+            &preference as *const _ as *const core::ffi::c_void,
+            std::mem::size_of_val(&preference) as u32,
+        )
+    };
 }
 
 #[cfg(windows)]
@@ -417,48 +447,57 @@ fn paint_hud(ctx: &egui::Context, phase: &Phase, peaks: &[f32]) {
     egui::CentralPanel::default()
         .frame(egui::Frame::NONE)
         .show(ctx, |ui| {
-            let rect = ui.max_rect().shrink(4.0);
+            let rect = ui.max_rect();
             let painter = ui.painter();
-            painter.rect_filled(rect, CornerRadius::same(18), Color32::from_rgb(10, 14, 20));
+            let radius = (rect.height() * 0.5) as u8;
+            painter.rect_filled(
+                rect,
+                CornerRadius::same(radius),
+                Color32::from_rgba_unmultiplied(16, 20, 28, 242),
+            );
             painter.rect_stroke(
                 rect,
-                CornerRadius::same(18),
-                Stroke::new(1.0, Color32::from_rgba_unmultiplied(46, 196, 184, 90)),
+                CornerRadius::same(radius),
+                Stroke::new(1.0, Color32::from_rgba_unmultiplied(255, 255, 255, 22)),
                 StrokeKind::Inside,
             );
 
             let (title, accent) = match phase {
-                Phase::Listening => ("Listening", Color32::from_rgb(46, 196, 184)),
+                Phase::Listening => ("Listening", Color32::from_rgb(52, 211, 190)),
                 Phase::Transcribing => ("Transcribing", Color32::from_rgb(125, 211, 252)),
                 Phase::Error(_) => ("Error", Color32::from_rgb(248, 113, 113)),
                 Phase::Idle => ("Noma", Color32::from_rgb(148, 163, 184)),
             };
 
-            painter.text(
-                Pos2::new(rect.left() + 16.0, rect.top() + 14.0),
-                egui::Align2::LEFT_TOP,
-                title,
-                egui::FontId::proportional(16.0),
-                Color32::from_rgb(241, 245, 249),
-            );
-
             let subtitle = match phase {
                 Phase::Error(message) => message.as_str(),
                 Phase::Listening => noma_hotkey::PTT_KEY_NAME,
-                Phase::Transcribing => "local engine",
-                Phase::Idle => "hold Right Ctrl",
+                Phase::Transcribing => "Almost done",
+                Phase::Idle => "Hold Right Ctrl",
             };
+
+            let dot = Pos2::new(rect.left() + 22.0, rect.center().y);
+            painter.circle_filled(dot, 5.0, accent);
+            painter.circle_filled(dot, 2.2, Color32::from_rgb(16, 20, 28));
+
             painter.text(
-                Pos2::new(rect.left() + 16.0, rect.top() + 36.0),
-                egui::Align2::LEFT_TOP,
+                Pos2::new(rect.left() + 36.0, rect.center().y - 11.0),
+                egui::Align2::LEFT_CENTER,
+                title,
+                egui::FontId::proportional(15.0),
+                Color32::from_rgb(248, 250, 252),
+            );
+            painter.text(
+                Pos2::new(rect.left() + 36.0, rect.center().y + 10.0),
+                egui::Align2::LEFT_CENTER,
                 subtitle,
                 egui::FontId::proportional(11.0),
                 Color32::from_rgb(148, 163, 184),
             );
 
             let wave = Rect::from_min_max(
-                Pos2::new(rect.left() + 140.0, rect.top() + 14.0),
-                Pos2::new(rect.right() - 16.0, rect.bottom() - 14.0),
+                Pos2::new(rect.left() + 158.0, rect.top() + 16.0),
+                Pos2::new(rect.right() - 22.0, rect.bottom() - 16.0),
             );
             paint_waveform(painter, wave, peaks, accent);
         });
@@ -469,16 +508,17 @@ fn paint_waveform(painter: &egui::Painter, rect: Rect, peaks: &[f32], color: Col
         return;
     }
     let n = peaks.len() as f32;
-    let gap = 2.0;
-    let bar_w = ((rect.width() - gap * (n - 1.0)) / n).max(1.5);
+    let gap = 3.0;
+    let bar_w = ((rect.width() - gap * (n - 1.0)) / n).max(2.5);
     let mid_y = rect.center().y;
     let max_h = rect.height() * 0.5;
+    let radius = (bar_w * 0.5).clamp(1.0, 4.0) as u8;
 
     for (i, peak) in peaks.iter().enumerate() {
         let x = rect.left() + i as f32 * (bar_w + gap);
-        let h = (peak.clamp(0.04, 1.0) * max_h).max(2.0);
+        let h = (peak.clamp(0.08, 1.0) * max_h).max(3.0);
         let bar = Rect::from_min_max(Pos2::new(x, mid_y - h), Pos2::new(x + bar_w, mid_y + h));
-        painter.rect_filled(bar, CornerRadius::same(2), color);
+        painter.rect_filled(bar, CornerRadius::same(radius), color);
     }
 }
 
