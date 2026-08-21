@@ -207,6 +207,33 @@ cargo test -p noma-audio --test capture -- --ignored --nocapture
 Two examples help when dictation records nothing: `devices` lists the mics and
 marks the one Noma would use, and `levels` measures what each one is hearing.
 
+## When the build fails to link
+
+```
+LINK : fatal error LNK1181: cannot open input file 'cargs.lib'
+```
+
+`cargs.lib` is not part of this repo. `sherpa-rs-sys` downloads the prebuilt
+sherpa-onnx libraries into `%LOCALAPPDATA%\sherpa-rs` and tells cargo to link
+against that directory. Cargo then caches those linker flags and will not
+re-run the build script unless its fingerprint changes, so if that cache is
+cleared, moved, half-extracted, or briefly locked by a virus scanner, the
+stale flags survive and the linker fails instead of the library being
+re-fetched.
+
+Force the build script to run again, which re-resolves and re-downloads:
+
+```bash
+cargo clean -p sherpa-rs-sys
+```
+
+If the library is present and only the final link is stale, this is enough and
+much faster:
+
+```bash
+cargo clean -p noma
+```
+
 ## Releasing
 
 `.github/workflows/build.yml` builds on Windows for every push and pull request,
