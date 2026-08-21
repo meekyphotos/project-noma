@@ -14,6 +14,8 @@ use noma_hotkey::PttEvent;
 use tray_icon::menu::{Menu, MenuEvent, MenuItem, PredefinedMenuItem};
 use tray_icon::{Icon, TrayIcon, TrayIconBuilder};
 
+mod mascot;
+
 const HUD_WIDTH: f32 = 380.0;
 const HUD_HEIGHT: f32 = 64.0;
 const PEAK_BINS: usize = 22;
@@ -98,6 +100,7 @@ pub fn run(config: HudConfig) -> Result<()> {
                 preview_until: None,
                 error_until: None,
                 last_shown: None,
+                mascot: mascot::Mascot::new(),
             }))
         }),
     )
@@ -199,6 +202,7 @@ struct HudApp {
     preview_until: Option<Instant>,
     error_until: Option<Instant>,
     last_shown: Option<bool>,
+    mascot: mascot::Mascot,
 }
 
 impl eframe::App for HudApp {
@@ -223,6 +227,7 @@ impl eframe::App for HudApp {
         }
 
         paint_hud(ctx, &snapshot.0, &snapshot.1);
+        self.mascot.show(ctx, &snapshot.0);
 
         ctx.request_repaint_after(if show {
             Duration::from_millis(16)
@@ -321,7 +326,7 @@ fn place_hud(show: bool) -> bool {
     let Some(hwnd) = find_noma_hwnd() else {
         return false;
     };
-    round_hwnd(hwnd);
+    glass_hwnd(hwnd);
 
     unsafe {
         if show {
@@ -373,17 +378,27 @@ fn place_hud(show: bool) -> bool {
 }
 
 #[cfg(windows)]
-fn round_hwnd(hwnd: windows::Win32::Foundation::HWND) {
+fn glass_hwnd(hwnd: windows::Win32::Foundation::HWND) {
     use windows::Win32::Graphics::Dwm::{
-        DwmSetWindowAttribute, DWMWA_WINDOW_CORNER_PREFERENCE, DWMWCP_ROUND,
+        DwmSetWindowAttribute, DWMSBT_TRANSIENTWINDOW, DWMWA_SYSTEMBACKDROP_TYPE,
+        DWMWA_WINDOW_CORNER_PREFERENCE, DWMWCP_ROUND,
     };
     let preference = DWMWCP_ROUND;
+    let backdrop = DWMSBT_TRANSIENTWINDOW;
     let _ = unsafe {
         DwmSetWindowAttribute(
             hwnd,
             DWMWA_WINDOW_CORNER_PREFERENCE,
             &preference as *const _ as *const core::ffi::c_void,
             std::mem::size_of_val(&preference) as u32,
+        )
+    };
+    let _ = unsafe {
+        DwmSetWindowAttribute(
+            hwnd,
+            DWMWA_SYSTEMBACKDROP_TYPE,
+            &backdrop as *const _ as *const core::ffi::c_void,
+            std::mem::size_of_val(&backdrop) as u32,
         )
     };
 }
@@ -418,7 +433,7 @@ fn find_noma_hwnd() -> Option<windows::Win32::Foundation::HWND> {
             return true.into();
         }
         let title = String::from_utf16_lossy(&buf[..len as usize]);
-        if title.eq_ignore_ascii_case("noma") {
+        if title == "Noma" {
             search.hwnd = hwnd;
             return false.into();
         }
@@ -453,7 +468,7 @@ fn paint_hud(ctx: &egui::Context, phase: &Phase, peaks: &[f32]) {
             painter.rect_filled(
                 rect,
                 CornerRadius::same(radius),
-                Color32::from_rgba_unmultiplied(16, 20, 28, 242),
+                Color32::from_rgba_unmultiplied(18, 24, 36, 150),
             );
             painter.rect_stroke(
                 rect,

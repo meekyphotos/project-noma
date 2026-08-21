@@ -1,4 +1,6 @@
 /target
+.idea/
+/higgsfield-output/
 **/*.rs.bk
 .DS_Store
 Thumbs.db
