@@ -9,45 +9,86 @@ use eframe::egui::{
 use crate::Phase;
 
 const MASCOT_SIZE: f32 = 157.0;
-const KEY: Color32 = Color32::from_rgb(255, 0, 255);
+const KEY: Color32 = Color32::WHITE;
+const FRAME: usize = 256 * 256 * 4;
+const FPS: f64 = 12.0;
+
+struct Clip {
+    frames: Vec<TextureHandle>,
+}
 
 pub struct Mascot {
-    texture: Option<TextureHandle>,
+    still: Option<TextureHandle>,
+    idle: Option<Clip>,
+    listen: Option<Clip>,
+    transcribe: Option<Clip>,
+    poke_clip: Option<Clip>,
     placed: bool,
     keyed: bool,
     dragging: bool,
     grab_dx: i32,
     grab_dy: i32,
-    poked_until: Option<Instant>,
+    poked_at: Option<Instant>,
 }
 
 impl Mascot {
     pub fn new() -> Self {
         Self {
-            texture: None,
+            still: None,
+            idle: None,
+            listen: None,
+            transcribe: None,
+            poke_clip: None,
             placed: false,
             keyed: false,
             dragging: false,
             grab_dx: 0,
             grab_dy: 0,
-            poked_until: None,
+            poked_at: None,
         }
     }
 
     pub fn show(&mut self, ctx: &Context, phase: &Phase) {
-        if self.texture.is_none() {
-            self.texture = Some(load_still(ctx));
+        if self.still.is_none() {
+            self.still = Some(load_rgba(ctx, "noma-front", "noma-front.rgba"));
+            self.idle = load_clip(ctx, "idle");
+            self.listen = load_clip(ctx, "listen");
+            self.transcribe = load_clip(ctx, "transcribe");
+            self.poke_clip = load_clip(ctx, "poke");
         }
 
-        let texture = self.texture.clone();
-        let poked = self
-            .poked_until
-            .map(|until| Instant::now() < until)
-            .unwrap_or(false);
+        if let Some(started) = self.poked_at {
+            if let Some(clip) = &self.poke_clip {
+                let frame = (started.elapsed().as_secs_f64() * FPS) as usize;
+                if frame >= clip.frames.len() {
+                    self.poked_at = None;
+                }
+            } else if started.elapsed().as_millis() > 700 {
+                self.poked_at = None;
+            }
+        }
+
+        let poked = self.poked_at.is_some();
         let mut poke = false;
         let mut drag_started = false;
         let mut dragging = false;
         let mut drag_stopped = false;
+        let tex = pick_frame(
+            phase,
+            self.poked_at,
+            ctx.input(|i| i.time),
+            self.still.as_ref(),
+            self.idle.as_ref(),
+            self.listen.as_ref(),
+            self.transcribe.as_ref(),
+            self.poke_clip.as_ref(),
+        );
+        let has_clip = match phase {
+            Phase::Listening => self.listen.is_some(),
+            Phase::Transcribing => self.transcribe.is_some(),
+            _ if poked => self.poke_clip.is_some(),
+            _ => self.idle.is_some(),
+        };
 
         ctx.show_viewport_immediate(
             ViewportId::from_hash_of("noma-mascot"),
@@ -67,7 +108,11 @@ impl Mascot {
                 ctx.send_viewport_cmd(ViewportCommand::WindowLevel(WindowLevel::AlwaysOnTop));
 
                 let t = ctx.input(|i| i.time);
-                let (offset, scale) = motion(phase, poked, t);
+                let (offset, scale) = if has_clip {
+                    (Vec2::ZERO, 1.0)
+                } else {
+                    motion(phase, poked, t)
+                };
 
                 egui::CentralPanel::default()
                     .frame(egui::Frame::NONE.fill(KEY))
@@ -86,7 +131,7 @@ impl Mascot {
                         }
                         response.on_hover_cursor(egui::CursorIcon::Grab);
 
-                        if let Some(tex) = &texture {
+                        if let Some(tex) = tex {
                             let size = Vec2::splat(MASCOT_SIZE * scale);
                             let rect =
                                 Rect::from_center_size(ui.max_rect().center() + offset, size);
@@ -118,9 +163,39 @@ impl Mascot {
             self.dragging = false;
         }
         if poke {
-            self.poked_until = Some(Instant::now() + std::time::Duration::from_millis(700));
+            self.poked_at = Some(Instant::now());
         }
     }
+}
+
+fn pick_frame<'a>(
+    phase: &Phase,
+    poked_at: Option<Instant>,
+    t: f64,
+    still: Option<&'a TextureHandle>,
+    idle: Option<&'a Clip>,
+    listen: Option<&'a Clip>,
+    transcribe: Option<&'a Clip>,
+    poke: Option<&'a Clip>,
+) -> Option<&'a TextureHandle> {
+    if let Some(started) = poked_at {
+        if let Some(clip) = poke {
+            let i = (started.elapsed().as_secs_f64() * FPS) as usize;
+            return clip.frames.get(i.min(clip.frames.len().saturating_sub(1)));
+        }
+    }
+    let clip = match phase {
+        Phase::Listening => listen,
+        Phase::Transcribing => transcribe,
+        _ => idle,
+    };
+    if let Some(clip) = clip {
+        if !clip.frames.is_empty() {
+            let i = ((t * FPS) as usize) % clip.frames.len();
+            return Some(&clip.frames[i]);
+        }
+    }
+    still
 }
 
 fn motion(phase: &Phase, poked: bool, t: f64) -> (Vec2, f32) {
@@ -145,19 +220,58 @@ fn motion(phase: &Phase, poked: bool, t: f64) -> (Vec2, f32) {
     }
 }
 
-fn load_still(ctx: &Context) -> TextureHandle {
-    const WIDTH: usize = 256;
-    const HEIGHT: usize = 256;
-    let path = [
-        PathBuf::from("assets/mascot/noma-front.rgba"),
-        PathBuf::from("crates/noma-hud/../../assets/mascot/noma-front.rgba"),
+fn load_rgba(ctx: &Context, name: &str, file: &str) -> TextureHandle {
+    let path = asset_path(file);
+    let mut bytes = std::fs::read(&path).unwrap_or_default();
+    composite_on_white(&mut bytes);
+    let color = ColorImage::from_rgba_unmultiplied([256, 256], &bytes);
+    ctx.load_texture(name, color, TextureOptions::LINEAR)
+}
+
+fn load_clip(ctx: &Context, name: &str) -> Option<Clip> {
+    let path = asset_path(&format!("{name}.rgba"));
+    let mut bytes = std::fs::read(&path).ok()?;
+    if bytes.len() < FRAME {
+        return None;
+    }
+    composite_on_white(&mut bytes);
+    let count = bytes.len() / FRAME;
+    let mut frames = Vec::with_capacity(count);
+    for i in 0..count {
+        let slice = &bytes[i * FRAME..(i + 1) * FRAME];
+        let color = ColorImage::from_rgba_unmultiplied([256, 256], slice);
+        frames.push(ctx.load_texture(format!("{name}-{i}"), color, TextureOptions::LINEAR));
+    }
+    Some(Clip { frames })
+}
+
+fn asset_path(file: &str) -> PathBuf {
+    [
+        PathBuf::from("assets/mascot").join(file),
+        PathBuf::from("crates/noma-hud/../../assets/mascot").join(file),
     ]
     .into_iter()
     .find(|path| path.exists())
-    .expect("noma-front.rgba");
-    let bytes = std::fs::read(&path).expect("read noma sprite");
-    let color = ColorImage::from_rgba_unmultiplied([WIDTH, HEIGHT], &bytes);
-    ctx.load_texture("noma-front", color, TextureOptions::LINEAR)
+    .unwrap_or_else(|| PathBuf::from("assets/mascot").join(file))
+}
+
+fn composite_on_white(bytes: &mut [u8]) {
+    for px in bytes.chunks_exact_mut(4) {
+        let a = px[3] as u16;
+        if a == 0 {
+            px[0] = 255;
+            px[1] = 255;
+            px[2] = 255;
+            px[3] = 255;
+            continue;
+        }
+        if a < 255 {
+            px[0] = ((px[0] as u16 * a + 255 * (255 - a)) / 255) as u8;
+            px[1] = ((px[1] as u16 * a + 255 * (255 - a)) / 255) as u8;
+            px[2] = ((px[2] as u16 * a + 255 * (255 - a)) / 255) as u8;
+            px[3] = 255;
+        }
+    }
 }
 
 #[cfg(windows)]
@@ -186,7 +300,7 @@ fn apply_color_key() -> bool {
     unsafe {
         let ex = GetWindowLongPtrW(hwnd, GWL_EXSTYLE);
         SetWindowLongPtrW(hwnd, GWL_EXSTYLE, ex | WS_EX_LAYERED.0 as isize);
-        let _ = SetLayeredWindowAttributes(hwnd, COLORREF(0x00FF00FF), 0, LWA_COLORKEY);
+        let _ = SetLayeredWindowAttributes(hwnd, COLORREF(0x00FFFFFF), 0, LWA_COLORKEY);
     }
     true
 }

@@ -1,6 +1,11 @@
 /target
 .idea/
 /higgsfield-output/
+assets/mascot/clips/
+assets/mascot/idle.rgba
+assets/mascot/listen.rgba
+assets/mascot/transcribe.rgba
+assets/mascot/poke.rgba
 **/*.rs.bk
 .DS_Store
 Thumbs.db
