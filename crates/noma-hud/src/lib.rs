@@ -1,11 +1,12 @@
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::Receiver;
 use std::sync::{Arc, Mutex};
+use std::thread;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use eframe::egui::{
-    self, Color32, CornerRadius, Pos2, Rect, Stroke, StrokeKind, Vec2, ViewportBuilder,
-    ViewportCommand,
+    self, Color32, CornerRadius, Pos2, Rect, Stroke, StrokeKind, ViewportBuilder, ViewportCommand,
 };
 use noma_asr::AsrEngine;
 use noma_audio::Recorder;
@@ -16,6 +17,7 @@ use tray_icon::{Icon, TrayIcon, TrayIconBuilder};
 const HUD_WIDTH: f32 = 320.0;
 const HUD_HEIGHT: f32 = 72.0;
 const PEAK_BINS: usize = 48;
+const PARKED: Pos2 = Pos2::new(-4000.0, -4000.0);
 
 #[derive(Clone, Debug)]
 pub enum Phase {
@@ -36,38 +38,51 @@ pub struct HudConfig {
     pub asr: Arc<dyn AsrEngine>,
 }
 
+struct Session {
+    ui: Arc<Mutex<UiState>>,
+    recorder: Recorder,
+    asr: Arc<dyn AsrEngine>,
+    wakeup: Arc<Mutex<Option<egui::Context>>>,
+    capturing: AtomicBool,
+    busy: AtomicBool,
+}
+
 pub fn run(config: HudConfig) -> Result<()> {
     let ui = Arc::new(Mutex::new(UiState {
         phase: Phase::Idle,
         peaks: vec![0.0; PEAK_BINS],
     }));
+    let wakeup = Arc::new(Mutex::new(None::<egui::Context>));
+    let session = Arc::new(Session {
+        ui: Arc::clone(&ui),
+        recorder: config.recorder.clone(),
+        asr: Arc::clone(&config.asr),
+        wakeup: Arc::clone(&wakeup),
+        capturing: AtomicBool::new(false),
+        busy: AtomicBool::new(false),
+    });
+    spawn_session(Arc::clone(&session), config.ptt_rx);
 
     let (tray, preview_item, quit_item) = build_tray().context("create tray icon")?;
-    let position = hud_position();
 
     let options = eframe::NativeOptions {
         viewport: ViewportBuilder::default()
             .with_title("Noma")
             .with_inner_size([HUD_WIDTH, HUD_HEIGHT])
-            .with_position(position)
+            .with_position(PARKED)
             .with_decorations(false)
-            .with_transparent(true)
+            .with_transparent(false)
             .with_always_on_top()
             .with_taskbar(false)
             .with_resizable(false)
             .with_mouse_passthrough(true)
-            .with_visible(false)
+            .with_visible(true)
             .with_active(false),
         centered: false,
         ..Default::default()
     };
 
-    let HudConfig {
-        ptt_rx,
-        recorder,
-        asr,
-    } = config;
-
+    let recorder = config.recorder;
     eframe::run_native(
         "noma",
         options,
@@ -76,42 +91,121 @@ pub fn run(config: HudConfig) -> Result<()> {
             Ok(Box::new(HudApp {
                 ui,
                 recorder,
-                asr,
-                ptt_rx,
+                wakeup,
                 tray,
                 preview_item,
                 quit_item,
                 preview_until: None,
                 error_until: None,
-                busy: false,
             }))
         }),
     )
     .map_err(|err| anyhow::anyhow!("hud event loop: {err}"))
 }
 
+fn spawn_session(session: Arc<Session>, ptt_rx: Receiver<PttEvent>) {
+    thread::Builder::new()
+        .name("noma-session".into())
+        .spawn(move || {
+            while let Ok(event) = ptt_rx.recv() {
+                match event {
+                    PttEvent::Pressed => session_press(&session),
+                    PttEvent::Released => session_release(&session),
+                }
+            }
+        })
+        .expect("spawn session thread");
+}
+
+fn session_press(session: &Session) {
+    if session.busy.load(Ordering::SeqCst) {
+        return;
+    }
+    match session.recorder.start() {
+        Ok(()) => {
+            session.capturing.store(true, Ordering::SeqCst);
+            let mut state = session.ui.lock().expect("ui state");
+            state.phase = Phase::Listening;
+            state.peaks = vec![0.0; PEAK_BINS];
+            eprintln!("noma: listening");
+        }
+        Err(err) => {
+            let mut state = session.ui.lock().expect("ui state");
+            state.phase = Phase::Error(format!("mic: {err:#}"));
+            eprintln!("noma: mic start failed: {err:#}");
+        }
+    }
+    wake(session);
+}
+
+fn session_release(session: &Arc<Session>) {
+    if !session.capturing.swap(false, Ordering::SeqCst) {
+        return;
+    }
+    let clip = match session.recorder.stop() {
+        Ok(clip) => clip,
+        Err(err) => {
+            session.ui.lock().expect("ui state").phase = Phase::Error(format!("mic stop: {err:#}"));
+            wake(session);
+            return;
+        }
+    };
+
+    session.busy.store(true, Ordering::SeqCst);
+    session.ui.lock().expect("ui state").phase = Phase::Transcribing;
+    wake(session);
+    eprintln!("noma: transcribing {:.1}s", clip.duration_secs());
+
+    let session = Arc::clone(session);
+    thread::spawn(move || {
+        let result = session
+            .asr
+            .transcribe(&clip)
+            .and_then(|transcript| noma_inject::paste_text(&transcript.text).map(|_| transcript));
+        {
+            let mut state = session.ui.lock().expect("ui state");
+            match result {
+                Ok(transcript) => {
+                    eprintln!("noma: pasted {}", transcript.text);
+                    state.phase = Phase::Idle;
+                }
+                Err(err) => {
+                    eprintln!("noma: paste/transcribe failed: {err:#}");
+                    state.phase = Phase::Error(err.to_string());
+                }
+            }
+        }
+        session.busy.store(false, Ordering::SeqCst);
+        wake(&session);
+    });
+}
+
+fn wake(session: &Session) {
+    if let Some(ctx) = session.wakeup.lock().expect("wakeup").as_ref() {
+        ctx.request_repaint();
+    }
+}
+
 struct HudApp {
     ui: Arc<Mutex<UiState>>,
     recorder: Recorder,
-    asr: Arc<dyn AsrEngine>,
-    ptt_rx: Receiver<PttEvent>,
+    wakeup: Arc<Mutex<Option<egui::Context>>>,
     #[allow(dead_code)]
     tray: TrayIcon,
     preview_item: MenuItem,
     quit_item: MenuItem,
     preview_until: Option<Instant>,
     error_until: Option<Instant>,
-    busy: bool,
 }
 
 impl eframe::App for HudApp {
     fn clear_color(&self, _visuals: &egui::Visuals) -> [f32; 4] {
-        [0.0, 0.0, 0.0, 0.0]
+        [10.0 / 255.0, 14.0 / 255.0, 20.0 / 255.0, 1.0]
     }
 
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        *self.wakeup.lock().expect("wakeup") = Some(ctx.clone());
         self.poll_menu(ctx);
-        self.poll_ptt();
         self.tick_timers();
         self.sync_peaks(ctx);
 
@@ -120,20 +214,18 @@ impl eframe::App for HudApp {
             (state.phase.clone(), state.peaks.clone())
         };
 
-        let visible = !matches!(snapshot.0, Phase::Idle);
-        ctx.send_viewport_cmd(ViewportCommand::Visible(visible));
+        let show = !matches!(snapshot.0, Phase::Idle);
+        let pos = if show { on_screen_pos(ctx) } else { PARKED };
+        ctx.send_viewport_cmd(ViewportCommand::OuterPosition(pos));
         ctx.send_viewport_cmd(ViewportCommand::MousePassthrough(true));
 
-        if visible {
-            paint_hud(ctx, &snapshot.0, &snapshot.1);
-        }
+        paint_hud(ctx, &snapshot.0, &snapshot.1);
 
-        let interval = if visible {
+        ctx.request_repaint_after(if show {
             Duration::from_millis(16)
         } else {
             Duration::from_millis(33)
-        };
-        ctx.request_repaint_after(interval);
+        });
     }
 }
 
@@ -143,82 +235,13 @@ impl HudApp {
             if event.id == self.quit_item.id() {
                 ctx.send_viewport_cmd(ViewportCommand::Close);
             } else if event.id == self.preview_item.id() {
-                self.preview_until = Some(Instant::now() + Duration::from_secs(2));
+                self.preview_until = Some(Instant::now() + Duration::from_secs(3));
                 let mut state = self.ui.lock().expect("ui state");
                 if matches!(state.phase, Phase::Idle | Phase::Error(_)) {
                     state.phase = Phase::Listening;
                 }
             }
         }
-    }
-
-    fn poll_ptt(&mut self) {
-        while let Ok(event) = self.ptt_rx.try_recv() {
-            match event {
-                PttEvent::Pressed => self.on_press(),
-                PttEvent::Released => self.on_release(),
-            }
-        }
-    }
-
-    fn on_press(&mut self) {
-        if self.busy || self.preview_until.is_some() {
-            return;
-        }
-        {
-            let state = self.ui.lock().expect("ui state");
-            if matches!(state.phase, Phase::Transcribing) {
-                return;
-            }
-        }
-        match self.recorder.start() {
-            Ok(()) => {
-                let mut state = self.ui.lock().expect("ui state");
-                state.phase = Phase::Listening;
-                state.peaks = vec![0.0; PEAK_BINS];
-            }
-            Err(err) => self.set_error(format!("mic: {err:#}")),
-        }
-    }
-
-    fn on_release(&mut self) {
-        if self.busy || self.preview_until.is_some() {
-            return;
-        }
-        let listening = {
-            let state = self.ui.lock().expect("ui state");
-            matches!(state.phase, Phase::Listening)
-        };
-        if !listening {
-            return;
-        }
-
-        let clip = match self.recorder.stop() {
-            Ok(clip) => clip,
-            Err(err) => {
-                self.set_error(format!("mic stop: {err:#}"));
-                return;
-            }
-        };
-
-        {
-            let mut state = self.ui.lock().expect("ui state");
-            state.phase = Phase::Transcribing;
-        }
-
-        self.busy = true;
-        let ui = Arc::clone(&self.ui);
-        let asr = Arc::clone(&self.asr);
-        std::thread::spawn(move || {
-            let result = asr
-                .transcribe(&clip)
-                .and_then(|transcript| noma_inject::paste_text(&transcript.text).map(|_| ()));
-            let mut state = ui.lock().expect("ui state");
-            match result {
-                Ok(()) => state.phase = Phase::Idle,
-                Err(err) => state.phase = Phase::Error(err.to_string()),
-            }
-        });
     }
 
     fn tick_timers(&mut self) {
@@ -232,13 +255,9 @@ impl HudApp {
             }
         }
 
-        if self.busy {
-            let phase = self.ui.lock().expect("ui state").phase.clone();
-            if !matches!(phase, Phase::Transcribing) {
-                self.busy = false;
-                if matches!(phase, Phase::Error(_)) {
-                    self.error_until = Some(Instant::now() + Duration::from_millis(2500));
-                }
+        if let Phase::Error(_) = self.ui.lock().expect("ui state").phase {
+            if self.error_until.is_none() {
+                self.error_until = Some(Instant::now() + Duration::from_millis(2500));
             }
         }
 
@@ -273,12 +292,18 @@ impl HudApp {
             _ => {}
         }
     }
+}
 
-    fn set_error(&mut self, message: String) {
-        self.ui.lock().expect("ui state").phase = Phase::Error(message);
-        self.error_until = Some(Instant::now() + Duration::from_millis(2500));
-        self.busy = false;
+fn on_screen_pos(ctx: &egui::Context) -> Pos2 {
+    if let Some(size) = ctx.input(|i| i.viewport().monitor_size) {
+        return Pos2::new((size.x - HUD_WIDTH) * 0.5, size.y - HUD_HEIGHT - 56.0);
     }
+    let (width, height) = primary_screen_px();
+    let scale = primary_scale();
+    Pos2::new(
+        (width as f32 / scale - HUD_WIDTH) * 0.5,
+        height as f32 / scale - HUD_HEIGHT - 56.0,
+    )
 }
 
 fn paint_hud(ctx: &egui::Context, phase: &Phase, peaks: &[f32]) {
@@ -287,11 +312,7 @@ fn paint_hud(ctx: &egui::Context, phase: &Phase, peaks: &[f32]) {
         .show(ctx, |ui| {
             let rect = ui.max_rect().shrink(4.0);
             let painter = ui.painter();
-            painter.rect_filled(
-                rect,
-                CornerRadius::same(18),
-                Color32::from_rgba_unmultiplied(10, 14, 20, 235),
-            );
+            painter.rect_filled(rect, CornerRadius::same(18), Color32::from_rgb(10, 14, 20));
             painter.rect_stroke(
                 rect,
                 CornerRadius::same(18),
@@ -306,12 +327,8 @@ fn paint_hud(ctx: &egui::Context, phase: &Phase, peaks: &[f32]) {
                 Phase::Idle => ("Noma", Color32::from_rgb(148, 163, 184)),
             };
 
-            let label_rect = Rect::from_min_size(
-                Pos2::new(rect.left() + 16.0, rect.top() + 14.0),
-                Vec2::new(118.0, 22.0),
-            );
             painter.text(
-                label_rect.min,
+                Pos2::new(rect.left() + 16.0, rect.top() + 14.0),
                 egui::Align2::LEFT_TOP,
                 title,
                 egui::FontId::proportional(16.0),
@@ -322,7 +339,7 @@ fn paint_hud(ctx: &egui::Context, phase: &Phase, peaks: &[f32]) {
                 Phase::Error(message) => message.as_str(),
                 Phase::Listening => noma_hotkey::PTT_KEY_NAME,
                 Phase::Transcribing => "local engine",
-                Phase::Idle => "",
+                Phase::Idle => "hold Right Ctrl",
             };
             painter.text(
                 Pos2::new(rect.left() + 16.0, rect.top() + 36.0),
@@ -399,14 +416,6 @@ fn tray_icon_image() -> Icon {
     Icon::from_rgba(rgba, size, size).expect("tray rgba icon")
 }
 
-fn hud_position() -> Pos2 {
-    let (width, height) = primary_screen_px();
-    Pos2::new(
-        ((width as f32) - HUD_WIDTH) * 0.5,
-        (height as f32) - HUD_HEIGHT - 48.0,
-    )
-}
-
 #[cfg(windows)]
 fn primary_screen_px() -> (i32, i32) {
     use windows::Win32::UI::WindowsAndMessaging::{GetSystemMetrics, SM_CXSCREEN, SM_CYSCREEN};
@@ -416,4 +425,19 @@ fn primary_screen_px() -> (i32, i32) {
 #[cfg(not(windows))]
 fn primary_screen_px() -> (i32, i32) {
     (1920, 1080)
+}
+
+#[cfg(windows)]
+fn primary_scale() -> f32 {
+    use windows::Win32::Graphics::Gdi::{GetDC, GetDeviceCaps, LOGPIXELSX};
+    unsafe {
+        let hdc = GetDC(None);
+        let dpi = GetDeviceCaps(Some(hdc), LOGPIXELSX);
+        (dpi as f32 / 96.0).max(1.0)
+    }
+}
+
+#[cfg(not(windows))]
+fn primary_scale() -> f32 {
+    1.0
 }

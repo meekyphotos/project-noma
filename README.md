@@ -11,12 +11,14 @@ cargo run -p noma
 ```
 
 1. A teal tray icon appears.
-2. Click **Preview HUD** in the tray to see the overlay.
+2. Click **Preview HUD** in the tray — a dark pill should appear at the bottom-center of the primary monitor for 3 seconds.
 3. Click a text field, hold **Right Ctrl**, speak, then release.
 4. Noma pastes `Hello from Noma (N.Ns)` — `N.N` is how long you held the key.
 5. **Quit** from the tray.
 
-Right Ctrl is swallowed while Noma is running so it does not act as a modifier in other apps.
+The terminal prints `noma: PTT pressed` / `released` when the hotkey is seen. Right Ctrl is swallowed while Noma is running so it does not act as a modifier in other apps.
+
+Quit any previous `noma.exe` before `cargo run` or the build cannot replace the binary.
 
 ## Architecture
 

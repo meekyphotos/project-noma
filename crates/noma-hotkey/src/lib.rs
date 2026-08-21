@@ -21,21 +21,24 @@ mod platform {
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::mpsc::{self, Receiver, Sender};
     use std::sync::OnceLock;
+    use std::thread;
+    use std::time::Duration;
 
     use anyhow::{anyhow, Context, Result};
-    use windows::Win32::Foundation::{LPARAM, LRESULT, WPARAM};
-    use windows::Win32::UI::Input::KeyboardAndMouse::VK_RCONTROL;
+    use windows::Win32::Foundation::{HINSTANCE, LPARAM, LRESULT, WPARAM};
+    use windows::Win32::System::LibraryLoader::GetModuleHandleW;
+    use windows::Win32::UI::Input::KeyboardAndMouse::{GetAsyncKeyState, VK_CONTROL, VK_RCONTROL};
     use windows::Win32::UI::WindowsAndMessaging::{
         CallNextHookEx, DispatchMessageW, GetMessageW, SetWindowsHookExW, TranslateMessage,
-        UnhookWindowsHookEx, HHOOK, KBDLLHOOKSTRUCT, MSG, WH_KEYBOARD_LL, WM_KEYDOWN, WM_KEYUP,
-        WM_SYSKEYDOWN, WM_SYSKEYUP,
+        KBDLLHOOKSTRUCT, MSG, WH_KEYBOARD_LL, WM_KEYDOWN, WM_KEYUP, WM_SYSKEYDOWN, WM_SYSKEYUP,
     };
 
     use super::PttEvent;
 
+    const LLKHF_EXTENDED: u32 = 0x01;
+
     static TX: OnceLock<Sender<PttEvent>> = OnceLock::new();
     static DOWN: AtomicBool = AtomicBool::new(false);
-    static HOOK: OnceLock<usize> = OnceLock::new();
 
     pub fn spawn() -> Result<Receiver<PttEvent>> {
         let (tx, rx) = mpsc::channel();
@@ -44,10 +47,11 @@ mod platform {
         std::thread::Builder::new()
             .name("noma-hotkey".into())
             .spawn(move || {
-                if let Err(err) = install(tx) {
+                if let Err(err) = install(tx.clone()) {
                     let _ = ready_tx.send(Err(err));
                     return;
                 }
+                spawn_poller(tx);
                 let _ = ready_tx.send(Ok(()));
                 unsafe {
                     let mut msg = MSG::default();
@@ -69,40 +73,60 @@ mod platform {
         TX.set(tx)
             .map_err(|_| anyhow!("PTT listener already started"))?;
         unsafe {
-            let hook = SetWindowsHookExW(WH_KEYBOARD_LL, Some(hook_proc), None, 0)
+            let module = GetModuleHandleW(None)
+                .ok()
+                .map(|module| HINSTANCE(module.0));
+            SetWindowsHookExW(WH_KEYBOARD_LL, Some(hook_proc), module, 0)
                 .context("SetWindowsHookExW WH_KEYBOARD_LL")?;
-            HOOK.set(hook.0 as usize)
-                .map_err(|_| anyhow!("hook already installed"))?;
-            // Keep the hook installed for process lifetime.
-            let _ = std::mem::forget(UnhookGuard(hook));
         }
         Ok(())
     }
 
-    struct UnhookGuard(HHOOK);
+    fn spawn_poller(tx: Sender<PttEvent>) {
+        thread::Builder::new()
+            .name("noma-ptt-poll".into())
+            .spawn(move || loop {
+                let physically_down =
+                    unsafe { GetAsyncKeyState(VK_RCONTROL.0 as i32) as u16 } & 0x8000 != 0;
+                if physically_down {
+                    emit(&tx, true);
+                } else {
+                    emit(&tx, false);
+                }
+                thread::sleep(Duration::from_millis(8));
+            })
+            .expect("spawn PTT poller");
+    }
 
-    impl Drop for UnhookGuard {
-        fn drop(&mut self) {
-            unsafe {
-                let _ = UnhookWindowsHookEx(self.0);
+    fn emit(tx: &Sender<PttEvent>, down: bool) {
+        if down {
+            if !DOWN.swap(true, Ordering::SeqCst) {
+                eprintln!("noma: PTT pressed");
+                let _ = tx.send(PttEvent::Pressed);
             }
+        } else if DOWN.swap(false, Ordering::SeqCst) {
+            eprintln!("noma: PTT released");
+            let _ = tx.send(PttEvent::Released);
         }
+    }
+
+    fn is_right_ctrl(kb: &KBDLLHOOKSTRUCT) -> bool {
+        kb.vkCode == u32::from(VK_RCONTROL.0)
+            || (kb.vkCode == u32::from(VK_CONTROL.0) && (kb.flags.0 & LLKHF_EXTENDED) != 0)
     }
 
     unsafe extern "system" fn hook_proc(code: i32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
         if code >= 0 && lparam.0 != 0 {
             let kb = unsafe { &*(lparam.0 as *const KBDLLHOOKSTRUCT) };
-            if kb.vkCode == u32::from(VK_RCONTROL.0) {
+            if is_right_ctrl(kb) {
                 let msg = wparam.0 as u32;
                 let is_down = msg == WM_KEYDOWN || msg == WM_SYSKEYDOWN;
                 let is_up = msg == WM_KEYUP || msg == WM_SYSKEYUP;
-                if is_down && !DOWN.swap(true, Ordering::SeqCst) {
-                    if let Some(tx) = TX.get() {
-                        let _ = tx.send(PttEvent::Pressed);
-                    }
-                } else if is_up && DOWN.swap(false, Ordering::SeqCst) {
-                    if let Some(tx) = TX.get() {
-                        let _ = tx.send(PttEvent::Released);
+                if let Some(tx) = TX.get() {
+                    if is_down {
+                        emit(tx, true);
+                    } else if is_up {
+                        emit(tx, false);
                     }
                 }
                 return LRESULT(1);
