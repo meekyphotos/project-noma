@@ -7,7 +7,7 @@ use anyhow::{Context, Result};
 use noma_asr::{AsrEngine, EngineSlot, FakeEngine, ParakeetConfig, ParakeetEngine};
 use noma_audio::Recorder;
 use noma_config::{History, Settings};
-use noma_hud::HudConfig;
+use noma_hud::{HudConfig, Phase};
 
 fn main() -> Result<()> {
     let settings = Settings::load().context("load settings")?;
@@ -19,16 +19,15 @@ fn main() -> Result<()> {
     // with an empty slot and fills it in from a background thread. The tray,
     // the HUD and the hotkey are all live in the meantime.
     let args: Vec<String> = std::env::args().collect();
+    let preview = preview_phase(&args);
+    if let Some(phase) = &preview {
+        eprintln!("noma: --preview, holding the HUD on screen as {phase:?}");
+    }
     let engine = if args.iter().any(|arg| arg == "--fake") {
         eprintln!("noma: --fake, transcription is a placeholder");
         EngineSlot::ready("fake engine", Arc::new(FakeEngine))
-    } else if args.iter().any(|arg| arg == "--preview") {
-        // Pin the HUD in its download state so it can be looked at, and
-        // screenshotted, without waiting for a real first run.
-        eprintln!("noma: --preview, holding the HUD on screen");
-        let slot = EngineSlot::loading("Preview");
-        slot.set_progress("Downloading model 5% (26 MB of 465 MB)", 4.5);
-        slot
+    } else if preview.is_some() {
+        EngineSlot::ready("preview", Arc::new(FakeEngine))
     } else {
         let slot = EngineSlot::loading("Looking for the model");
         spawn_engine_loader(slot.clone(), settings.clone());
@@ -46,7 +45,27 @@ fn main() -> Result<()> {
         engine,
         settings,
         history,
+        preview,
     })
+}
+
+/// Parse `--preview` and `--preview <phase>`.
+///
+/// Holds the overlay on screen in one state so it can be looked at, and
+/// screenshotted, without dictating or waiting for a first run.
+fn preview_phase(args: &[String]) -> Option<Phase> {
+    let index = args.iter().position(|arg| arg == "--preview")?;
+    let phase = match args.get(index + 1).map(String::as_str) {
+        Some("transcribing") => Phase::Transcribing,
+        Some("loading") => Phase::Loading {
+            message: "Downloading model 42% (195 MB of 465 MB)".to_string(),
+            percent: 38.0,
+        },
+        Some("error") => Phase::Error("No sound from Microphone (Yeti Classic)".to_string()),
+        // Listening is the state the overlay is in almost all of the time.
+        _ => Phase::Listening,
+    };
+    Some(phase)
 }
 
 /// Fetch the model if needed, open it, and hand it to the slot.

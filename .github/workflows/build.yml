@@ -59,13 +59,8 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
         with:
-          # Bump when the sherpa-onnx version changes.
-          key: sherpa-1.12.9
-          # sherpa-rs-sys downloads its prebuilt libraries into the user cache
-          # directory, which is neither ~/.cargo nor target/, so rust-cache
-          # would otherwise refetch ~180 MB on every run.
-          cache-directories: |
-            ~\AppData\Local\sherpa-rs
+          # Bump when the vendored sherpa-onnx version changes.
+          key: sherpa-1.12.9-vendored
           save-if: ${{ github.ref == 'refs/heads/main' }}
 
       - name: Test
@@ -127,23 +122,15 @@ jobs:
           # actually re-runs its build script, and only `if !dst.exists()`. A
           # restored cache can leave the build fingerprint-fresh while the DLLs
           # were pruned from target/, which produces a green build and an exe
-          # that cannot start. Recover them from the download cache, then
-          # assert, rather than trusting the build script.
+          # that cannot start. They are vendored in this repo, so take them
+          # from source rather than trusting the build script.
+          Copy-Item vendor\sherpa-onnx\lib\*.dll $stage -Force
           $required = @(
             'sherpa-onnx-c-api.dll', 'sherpa-onnx-cxx-api.dll',
             'onnxruntime.dll', 'onnxruntime_providers_shared.dll', 'cargs.dll'
           )
           $missing = $required | Where-Object { -not (Test-Path (Join-Path $stage $_)) }
-          if ($missing) {
-            Write-Host "not in target\release, recovering from the sherpa-rs cache: $($missing -join ', ')"
-            $cached = Get-ChildItem "$env:LOCALAPPDATA\sherpa-rs" -Recurse -Filter *.dll -ErrorAction SilentlyContinue
-            foreach ($dll in $missing) {
-              $found = $cached | Where-Object { $_.Name -eq $dll } | Select-Object -First 1
-              if ($found) { Copy-Item $found.FullName $stage }
-            }
-          }
-          $missing = $required | Where-Object { -not (Test-Path (Join-Path $stage $_)) }
-          if ($missing) { throw "runtime DLLs missing, the zip would not start: $($missing -join ', ')" }
+          if ($missing) { throw "runtime DLLs missing from vendor\sherpa-onnx\lib: $($missing -join ', ')" }
 
           # onnxruntime.dll imports MSVCP140 and VCRUNTIME140, which a clean
           # Windows install does not have. Ship the runtime app-local so the

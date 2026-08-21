@@ -63,6 +63,10 @@ pub struct HudConfig {
     pub engine: EngineSlot,
     pub settings: Settings,
     pub history: History,
+    /// Pin the HUD to one phase and leave it on screen.
+    ///
+    /// For looking at the overlay, and screenshotting it, without dictating.
+    pub preview: Option<Phase>,
 }
 
 pub fn run(config: HudConfig) -> Result<()> {
@@ -103,6 +107,7 @@ pub fn run(config: HudConfig) -> Result<()> {
 
     let recorder = config.recorder;
     let engine = config.engine;
+    let preview = config.preview;
     eframe::run_native(
         "noma",
         options,
@@ -117,7 +122,12 @@ pub fn run(config: HudConfig) -> Result<()> {
                 wakeup,
                 tray,
                 show_history: Arc::new(AtomicBool::new(false)),
-                preview_until: None,
+                // Far enough out that it never expires; it also makes
+                // sync_peaks draw its animated stand-in waveform.
+                preview_until: preview
+                    .as_ref()
+                    .map(|_| Instant::now() + Duration::from_secs(86_400)),
+                preview,
                 error_until: None,
                 last_shown: None,
                 engine_settled: false,
@@ -184,6 +194,8 @@ struct HudApp {
     tray: Tray,
     /// Shared with the history window so it can close itself.
     show_history: Arc<AtomicBool>,
+    /// When set, the HUD stays on screen in this phase and ignores the engine.
+    preview: Option<Phase>,
     preview_until: Option<Instant>,
     error_until: Option<Instant>,
     last_shown: Option<bool>,
@@ -199,6 +211,9 @@ impl eframe::App for HudApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         *self.wakeup.lock().expect("wakeup") = Some(ctx.clone());
         self.poll_menu(ctx);
+        if let Some(phase) = self.preview.clone() {
+            self.ui.lock().expect("ui state").phase = phase;
+        }
         self.sync_engine();
         self.tick_timers();
         self.sync_peaks(ctx);
@@ -259,6 +274,9 @@ impl HudApp {
     /// Downloading Parakeet takes minutes, and a first run with no feedback
     /// looks exactly like a broken install.
     fn sync_engine(&mut self) {
+        if self.preview.is_some() {
+            return;
+        }
         let status = self.engine.status();
         let mut state = self.ui.lock().expect("ui state");
         // Never interrupt a dictation that is already under way.

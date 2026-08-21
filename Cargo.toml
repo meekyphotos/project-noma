@@ -38,7 +38,7 @@ noma-model = { path = "crates/noma-model" }
 noma-text = { path = "crates/noma-text" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-sherpa-rs = { version = "0.6", default-features = false, features = ["download-binaries"] }
+sherpa-rs = { version = "0.6", default-features = false }
 tar = "0.4"
 toml = "0.8"
 tray-icon = "0.21"
