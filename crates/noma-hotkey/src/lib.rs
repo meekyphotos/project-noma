@@ -1,4 +1,5 @@
 use std::sync::mpsc::Receiver;
+use std::time::Duration;
 
 use anyhow::Result;
 
@@ -16,18 +17,25 @@ pub fn spawn() -> Result<Receiver<PttEvent>> {
     platform::spawn()
 }
 
+/// Block until Right Ctrl is physically up, then settle before paste.
+pub fn wait_until_released(timeout: Duration) {
+    platform::wait_until_released(timeout);
+}
+
 #[cfg(windows)]
 mod platform {
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::mpsc::{self, Receiver, Sender};
     use std::sync::OnceLock;
     use std::thread;
-    use std::time::Duration;
+    use std::time::{Duration, Instant};
 
     use anyhow::{anyhow, Context, Result};
     use windows::Win32::Foundation::{HINSTANCE, LPARAM, LRESULT, WPARAM};
     use windows::Win32::System::LibraryLoader::GetModuleHandleW;
-    use windows::Win32::UI::Input::KeyboardAndMouse::{GetAsyncKeyState, VK_CONTROL, VK_RCONTROL};
+    use windows::Win32::UI::Input::KeyboardAndMouse::{
+        GetAsyncKeyState, VK_CONTROL, VK_LCONTROL, VK_RCONTROL,
+    };
     use windows::Win32::UI::WindowsAndMessaging::{
         CallNextHookEx, DispatchMessageW, GetMessageW, SetWindowsHookExW, TranslateMessage,
         KBDLLHOOKSTRUCT, MSG, WH_KEYBOARD_LL, WM_KEYDOWN, WM_KEYUP, WM_SYSKEYDOWN, WM_SYSKEYUP,
@@ -36,6 +44,7 @@ mod platform {
     use super::PttEvent;
 
     const LLKHF_EXTENDED: u32 = 0x01;
+    const LLKHF_INJECTED: u32 = 0x10;
 
     static TX: OnceLock<Sender<PttEvent>> = OnceLock::new();
     static DOWN: AtomicBool = AtomicBool::new(false);
@@ -47,11 +56,10 @@ mod platform {
         std::thread::Builder::new()
             .name("noma-hotkey".into())
             .spawn(move || {
-                if let Err(err) = install(tx.clone()) {
+                if let Err(err) = install(tx) {
                     let _ = ready_tx.send(Err(err));
                     return;
                 }
-                spawn_poller(tx);
                 let _ = ready_tx.send(Ok(()));
                 unsafe {
                     let mut msg = MSG::default();
@@ -82,20 +90,23 @@ mod platform {
         Ok(())
     }
 
-    fn spawn_poller(tx: Sender<PttEvent>) {
-        thread::Builder::new()
-            .name("noma-ptt-poll".into())
-            .spawn(move || loop {
-                let physically_down =
-                    unsafe { GetAsyncKeyState(VK_RCONTROL.0 as i32) as u16 } & 0x8000 != 0;
-                if physically_down {
-                    emit(&tx, true);
-                } else {
-                    emit(&tx, false);
-                }
-                thread::sleep(Duration::from_millis(8));
-            })
-            .expect("spawn PTT poller");
+    pub fn wait_until_released(timeout: Duration) {
+        let deadline = Instant::now() + timeout;
+        while Instant::now() < deadline {
+            if !ctrl_down() {
+                break;
+            }
+            thread::sleep(Duration::from_millis(8));
+        }
+        thread::sleep(Duration::from_millis(25));
+    }
+
+    fn ctrl_down() -> bool {
+        unsafe {
+            [VK_CONTROL, VK_LCONTROL, VK_RCONTROL]
+                .into_iter()
+                .any(|key| GetAsyncKeyState(key.0 as i32) as u16 & 0x8000 != 0)
+        }
     }
 
     fn emit(tx: &Sender<PttEvent>, down: bool) {
@@ -118,6 +129,9 @@ mod platform {
     unsafe extern "system" fn hook_proc(code: i32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
         if code >= 0 && lparam.0 != 0 {
             let kb = unsafe { &*(lparam.0 as *const KBDLLHOOKSTRUCT) };
+            if (kb.flags.0 & LLKHF_INJECTED) != 0 {
+                return unsafe { CallNextHookEx(None, code, wparam, lparam) };
+            }
             if is_right_ctrl(kb) {
                 let msg = wparam.0 as u32;
                 let is_down = msg == WM_KEYDOWN || msg == WM_SYSKEYDOWN;
@@ -139,6 +153,7 @@ mod platform {
 #[cfg(not(windows))]
 mod platform {
     use std::sync::mpsc::Receiver;
+    use std::time::Duration;
 
     use anyhow::{bail, Result};
 
@@ -146,5 +161,9 @@ mod platform {
 
     pub fn spawn() -> Result<Receiver<PttEvent>> {
         bail!("Noma's hold-to-talk listener currently supports Windows only");
+    }
+
+    pub fn wait_until_released(timeout: Duration) {
+        std::thread::sleep(timeout.min(Duration::from_millis(25)));
     }
 }

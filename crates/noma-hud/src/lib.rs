@@ -158,6 +158,7 @@ fn session_release(session: &Arc<Session>) {
 
     let session = Arc::clone(session);
     thread::spawn(move || {
+        noma_hotkey::wait_until_released(Duration::from_millis(400));
         let result = session
             .asr
             .transcribe(&clip)
