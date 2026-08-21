@@ -75,7 +75,7 @@ pub fn run(config: HudConfig) -> Result<()> {
             .with_always_on_top()
             .with_taskbar(false)
             .with_resizable(false)
-            .with_mouse_passthrough(true)
+            .with_mouse_passthrough(false)
             .with_visible(true)
             .with_active(false),
         centered: false,
@@ -97,6 +97,7 @@ pub fn run(config: HudConfig) -> Result<()> {
                 quit_item,
                 preview_until: None,
                 error_until: None,
+                last_shown: None,
             }))
         }),
     )
@@ -197,6 +198,7 @@ struct HudApp {
     quit_item: MenuItem,
     preview_until: Option<Instant>,
     error_until: Option<Instant>,
+    last_shown: Option<bool>,
 }
 
 impl eframe::App for HudApp {
@@ -216,9 +218,9 @@ impl eframe::App for HudApp {
         };
 
         let show = !matches!(snapshot.0, Phase::Idle);
-        let pos = if show { on_screen_pos(ctx) } else { PARKED };
-        ctx.send_viewport_cmd(ViewportCommand::OuterPosition(pos));
-        ctx.send_viewport_cmd(ViewportCommand::MousePassthrough(true));
+        if self.last_shown != Some(show) && place_hud(show) {
+            self.last_shown = Some(show);
+        }
 
         paint_hud(ctx, &snapshot.0, &snapshot.1);
 
@@ -295,16 +297,120 @@ impl HudApp {
     }
 }
 
-fn on_screen_pos(ctx: &egui::Context) -> Pos2 {
-    if let Some(size) = ctx.input(|i| i.viewport().monitor_size) {
-        return Pos2::new((size.x - HUD_WIDTH) * 0.5, size.y - HUD_HEIGHT - 56.0);
+#[cfg(windows)]
+fn place_hud(show: bool) -> bool {
+    use windows::Win32::Foundation::RECT;
+    use windows::Win32::UI::WindowsAndMessaging::{
+        GetWindowRect, SetWindowPos, SystemParametersInfoW, HWND_TOPMOST, SPI_GETWORKAREA,
+        SWP_NOACTIVATE, SWP_NOSIZE, SWP_SHOWWINDOW, SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS,
+    };
+
+    let Some(hwnd) = find_noma_hwnd() else {
+        return false;
+    };
+
+    unsafe {
+        if show {
+            let mut work = RECT::default();
+            if SystemParametersInfoW(
+                SPI_GETWORKAREA,
+                0,
+                Some(&mut work as *mut RECT as *mut core::ffi::c_void),
+                SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS(0),
+            )
+            .is_err()
+            {
+                return false;
+            }
+            let mut wr = RECT::default();
+            if GetWindowRect(hwnd, &mut wr).is_err() {
+                return false;
+            }
+            let width = (wr.right - wr.left).max(1);
+            let height = (wr.bottom - wr.top).max(1);
+            let x = work.left + (work.right - work.left - width) / 2;
+            let y = work.bottom - height - 48;
+            let _ = SetWindowPos(
+                hwnd,
+                Some(HWND_TOPMOST),
+                x,
+                y,
+                0,
+                0,
+                SWP_NOSIZE | SWP_NOACTIVATE | SWP_SHOWWINDOW,
+            );
+            eprintln!(
+                "noma: HUD show hwnd={hwnd:?} work=({},{},{},{}) pos=({x},{y}) size=({width}x{height})",
+                work.left, work.top, work.right, work.bottom
+            );
+        } else {
+            let _ = SetWindowPos(
+                hwnd,
+                Some(HWND_TOPMOST),
+                -32000,
+                -32000,
+                0,
+                0,
+                SWP_NOSIZE | SWP_NOACTIVATE | SWP_SHOWWINDOW,
+            );
+        }
     }
-    let (width, height) = primary_screen_px();
-    let scale = primary_scale();
-    Pos2::new(
-        (width as f32 / scale - HUD_WIDTH) * 0.5,
-        height as f32 / scale - HUD_HEIGHT - 56.0,
-    )
+    true
+}
+
+#[cfg(windows)]
+fn find_noma_hwnd() -> Option<windows::Win32::Foundation::HWND> {
+    use windows::core::BOOL;
+    use windows::Win32::Foundation::{HWND, LPARAM};
+    use windows::Win32::System::Threading::GetCurrentProcessId;
+    use windows::Win32::UI::WindowsAndMessaging::{GetWindowTextW, GetWindowThreadProcessId};
+
+    struct Search {
+        pid: u32,
+        hwnd: HWND,
+    }
+
+    let mut search = Search {
+        pid: unsafe { GetCurrentProcessId() },
+        hwnd: HWND::default(),
+    };
+
+    unsafe extern "system" fn enum_proc(hwnd: HWND, lparam: LPARAM) -> BOOL {
+        let search = unsafe { &mut *(lparam.0 as *mut Search) };
+        let mut pid = 0u32;
+        unsafe { GetWindowThreadProcessId(hwnd, Some(&mut pid)) };
+        if pid != search.pid {
+            return true.into();
+        }
+        let mut buf = [0u16; 64];
+        let len = unsafe { GetWindowTextW(hwnd, &mut buf) };
+        if len <= 0 {
+            return true.into();
+        }
+        let title = String::from_utf16_lossy(&buf[..len as usize]);
+        if title.eq_ignore_ascii_case("noma") {
+            search.hwnd = hwnd;
+            return false.into();
+        }
+        true.into()
+    }
+
+    let _ = unsafe {
+        windows::Win32::UI::WindowsAndMessaging::EnumWindows(
+            Some(enum_proc),
+            LPARAM(&mut search as *mut Search as isize),
+        )
+    };
+    if search.hwnd.0.is_null() {
+        None
+    } else {
+        Some(search.hwnd)
+    }
+}
+
+#[cfg(not(windows))]
+fn place_hud(_show: bool) -> bool {
+    true
 }
 
 fn paint_hud(ctx: &egui::Context, phase: &Phase, peaks: &[f32]) {
@@ -415,30 +521,4 @@ fn tray_icon_image() -> Icon {
         }
     }
     Icon::from_rgba(rgba, size, size).expect("tray rgba icon")
-}
-
-#[cfg(windows)]
-fn primary_screen_px() -> (i32, i32) {
-    use windows::Win32::UI::WindowsAndMessaging::{GetSystemMetrics, SM_CXSCREEN, SM_CYSCREEN};
-    unsafe { (GetSystemMetrics(SM_CXSCREEN), GetSystemMetrics(SM_CYSCREEN)) }
-}
-
-#[cfg(not(windows))]
-fn primary_screen_px() -> (i32, i32) {
-    (1920, 1080)
-}
-
-#[cfg(windows)]
-fn primary_scale() -> f32 {
-    use windows::Win32::Graphics::Gdi::{GetDC, GetDeviceCaps, LOGPIXELSX};
-    unsafe {
-        let hdc = GetDC(None);
-        let dpi = GetDeviceCaps(Some(hdc), LOGPIXELSX);
-        (dpi as f32 / 96.0).max(1.0)
-    }
-}
-
-#[cfg(not(windows))]
-fn primary_scale() -> f32 {
-    1.0
 }
