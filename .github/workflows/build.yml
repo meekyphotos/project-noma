@@ -103,6 +103,19 @@ jobs:
           key: sherpa-1.12.9-vendored-windows
           save-if: ${{ github.ref == 'refs/heads/main' }}
 
+      # sherpa-rs-sys's build script places these next to a test binary too,
+      # but only when cargo actually re-runs the build script, and only
+      # `if !dst.exists()`. A cache restore can leave the build fingerprint
+      # fresh while rust-cache has pruned the DLLs from target/debug/deps, so
+      # the build script never re-copies them and `cargo test` fails with
+      # STATUS_DLL_NOT_FOUND instead of running. They are vendored in this
+      # repo, so stage them from source rather than trusting the build script.
+      - name: Stage runtime DLLs for tests
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path target\debug\deps | Out-Null
+          Copy-Item vendor\sherpa-onnx\lib\*.dll target\debug\deps -Force
+
       - name: Test
         run: cargo test --workspace --locked
         # The end-to-end Parakeet and microphone suites are #[ignore]d: one
@@ -203,6 +216,19 @@ jobs:
         with:
           key: sherpa-1.12.9-vendored-macos
           save-if: ${{ github.ref == 'refs/heads/main' }}
+
+      # See the Windows job for why: a cache restore can leave the build
+      # fingerprint fresh while rust-cache has pruned the dylibs from
+      # target/debug/deps, so sherpa-rs-sys's build script never re-copies
+      # them and the noma binary's own test aborts with "Library not loaded"
+      # instead of running.
+      - name: Stage runtime dylibs for tests
+        run: |
+          set -euo pipefail
+          mkdir -p target/debug/deps
+          cp vendor/sherpa-onnx/lib/libsherpa-onnx-c-api.dylib target/debug/deps/
+          cp vendor/sherpa-onnx/lib/libsherpa-onnx-cxx-api.dylib target/debug/deps/
+          cp vendor/sherpa-onnx/lib/libonnxruntime.1.17.1.dylib target/debug/deps/
 
       - name: Test
         run: cargo test --workspace --locked
