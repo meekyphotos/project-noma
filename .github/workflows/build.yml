@@ -283,6 +283,11 @@ jobs:
     permissions:
       contents: write
     steps:
+      # `gh release` resolves the target repository from the git remote in
+      # the working directory, so without this it fails with "not a git
+      # repository" before ever making an API call.
+      - uses: actions/checkout@v7
+
       - uses: actions/download-artifact@v7
         with:
           pattern: "noma-*"
