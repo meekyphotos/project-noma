@@ -113,7 +113,9 @@ pub fn find(id: &str) -> Option<ModelSpec> {
     catalog().iter().copied().find(|spec| spec.id == id)
 }
 
-/// `%LOCALAPPDATA%\noma\models` on Windows, `~/.local/share/noma/models` elsewhere.
+/// `%LOCALAPPDATA%\noma\models` on Windows,
+/// `~/Library/Application Support/noma/models` on macOS,
+/// `~/.local/share/noma/models` on Linux.
 pub fn models_dir() -> Result<PathBuf> {
     let base = dirs::data_local_dir().ok_or_else(|| anyhow!("no local data directory"))?;
     Ok(base.join("noma").join("models"))

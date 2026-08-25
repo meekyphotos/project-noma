@@ -32,7 +32,15 @@ pub fn deliver(text: &str, how: Delivery) -> Result<()> {
     }
 }
 
-/// Copy `text` and send Ctrl+V to the focused window, then restore the clipboard.
+/// The modifier that means "paste" for the running OS: Cmd on macOS, Ctrl
+/// everywhere else.
+#[cfg(target_os = "macos")]
+const PASTE_MODIFIER: Key = Key::Meta;
+#[cfg(not(target_os = "macos"))]
+const PASTE_MODIFIER: Key = Key::Control;
+
+/// Copy `text` and send the paste shortcut to the focused window, then
+/// restore the clipboard.
 pub fn paste_text(text: &str) -> Result<()> {
     let mut clipboard = Clipboard::new().context("open clipboard")?;
     let previous = clipboard.get_text().ok();
@@ -42,9 +50,9 @@ pub fn paste_text(text: &str) -> Result<()> {
     thread::sleep(Duration::from_millis(30));
 
     let mut enigo = Enigo::new(&Settings::default()).context("create input device")?;
-    enigo.key(Key::Control, Press).context("ctrl down")?;
+    enigo.key(PASTE_MODIFIER, Press).context("modifier down")?;
     enigo.key(Key::Unicode('v'), Click).context("press v")?;
-    enigo.key(Key::Control, Release).context("ctrl up")?;
+    enigo.key(PASTE_MODIFIER, Release).context("modifier up")?;
 
     // Restoring too early would put the old contents back before the paste has
     // been read, which loses the dictation entirely.

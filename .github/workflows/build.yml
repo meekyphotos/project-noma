@@ -28,13 +28,53 @@ env:
   RUSTUP_MAX_RETRIES: "10"
 
 jobs:
-  build:
+  # Cheap and OS-agnostic, so the two platform jobs below don't each re-derive
+  # the same version and can't disagree about it. Reading Cargo.toml this way
+  # never runs a build script, so it needs none of the sherpa-onnx toolchain.
+  version:
+    name: derive version
+    runs-on: ubuntu-latest
+    outputs:
+      channel: ${{ steps.meta.outputs.channel }}
+      version: ${{ steps.meta.outputs.version }}
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Derive version
+        id: meta
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo_version=$(cargo metadata --format-version 1 --no-deps |
+            jq -r '.packages[] | select(.name == "noma") | .version')
+          short=${GITHUB_SHA:0:7}
+
+          if [[ "$GITHUB_REF" == refs/tags/v* ]]; then
+            tag="$GITHUB_REF_NAME"
+            # A tag that disagrees with Cargo.toml would ship a binary whose
+            # reported version is a lie. Catch it before either platform builds.
+            if [[ "${tag#v}" != "$cargo_version" ]]; then
+              echo "::error::tag $tag does not match the noma version $cargo_version in Cargo.toml"
+              exit 1
+            fi
+            channel=stable
+            version="$cargo_version"
+          else
+            channel=nightly
+            version="$cargo_version+$short"
+          fi
+
+          echo "channel=$channel" >> "$GITHUB_OUTPUT"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "$channel $version"
+
+  build-windows:
     name: x86_64-pc-windows-msvc
+    needs: version
     # Pinned rather than windows-latest: a future flip of that alias must not
     # silently change what a release was built against.
     runs-on: windows-2025
-    permissions:
-      contents: write
     steps:
       - uses: actions/checkout@v7
 
@@ -60,7 +100,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           # Bump when the vendored sherpa-onnx version changes.
-          key: sherpa-1.12.9-vendored
+          key: sherpa-1.12.9-vendored-windows
           save-if: ${{ github.ref == 'refs/heads/main' }}
 
       - name: Test
@@ -71,44 +111,19 @@ jobs:
       - name: Build
         run: cargo build --release --locked -p noma
 
-      - name: Derive version
+      - name: Package
         id: meta
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
-          $cargoVersion = (cargo metadata --format-version 1 --no-deps | ConvertFrom-Json).packages |
-            Where-Object { $_.name -eq 'noma' } | Select-Object -ExpandProperty version
-          $short = $env:GITHUB_SHA.Substring(0, 7)
-
-          if ($env:GITHUB_REF -like 'refs/tags/v*') {
-            $tag = $env:GITHUB_REF_NAME
-            # A tag that disagrees with Cargo.toml would ship a binary whose
-            # reported version is a lie. Catch it before publishing.
-            if ($tag.Substring(1) -ne $cargoVersion) {
-              Write-Host "::error::tag $tag does not match the noma version $cargoVersion in Cargo.toml"
-              exit 1
-            }
-            $channel = 'stable'
-            $version = $cargoVersion
-            $stem    = "noma-v$version-x86_64-pc-windows-msvc"
+          if ('${{ needs.version.outputs.channel }}' -eq 'stable') {
+            $stem = "noma-v${{ needs.version.outputs.version }}-x86_64-pc-windows-msvc"
           } else {
-            $channel = 'nightly'
-            $version = "$cargoVersion+$short"
             # A fixed name keeps /releases/download/nightly/<file> working.
-            $stem    = 'noma-nightly-x86_64-pc-windows-msvc'
+            $stem = 'noma-nightly-x86_64-pc-windows-msvc'
           }
+          "stem=$stem" | Out-File $env:GITHUB_OUTPUT -Append -Encoding utf8
 
-          "channel=$channel" | Out-File $env:GITHUB_OUTPUT -Append -Encoding utf8
-          "version=$version" | Out-File $env:GITHUB_OUTPUT -Append -Encoding utf8
-          "stem=$stem"       | Out-File $env:GITHUB_OUTPUT -Append -Encoding utf8
-          Write-Host "$channel $version -> $stem.zip"
-
-      - name: Package
-        id: package
-        shell: pwsh
-        run: |
-          $ErrorActionPreference = 'Stop'
-          $stem  = '${{ steps.meta.outputs.stem }}'
           $stage = Join-Path $env:RUNNER_TEMP $stem
           New-Item -ItemType Directory -Force -Path $stage | Out-Null
 
@@ -161,55 +176,158 @@ jobs:
           Get-ChildItem $stage | Select-Object Name, Length | Format-Table -AutoSize
           Write-Host "zip: $([math]::Round((Get-Item $zip).Length / 1MB, 1)) MB"
 
-      # Lane 1: every run, including pull requests, gets a downloadable build.
+      # Every run, including pull requests, gets a downloadable build.
       - uses: actions/upload-artifact@v7
         with:
           name: ${{ steps.meta.outputs.stem }}
-          path: ${{ steps.package.outputs.zip }}
+          path: |
+            ${{ steps.meta.outputs.zip }}
+            ${{ steps.meta.outputs.sha }}
           retention-days: 30
           if-no-files-found: error
+
+  build-macos:
+    name: aarch64-apple-darwin
+    needs: version
+    # Pinned rather than macos-latest, for the same reason as windows-2025.
+    # GitHub's macos-15 runners are Apple Silicon, so this is a native arm64
+    # build; the vendored sherpa-onnx libraries are a universal2 (arm64 +
+    # x86_64) archive, so an Intel lane can be added later without re-vendoring.
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: sherpa-1.12.9-vendored-macos
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+
+      - name: Test
+        run: cargo test --workspace --locked
+        # The end-to-end Parakeet and microphone suites are #[ignore]d: one
+        # needs a 465 MB model download, the other needs a real input device.
+
+      - name: Build
+        run: cargo build --release --locked -p noma
+
+      - name: Package
+        id: meta
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ '${{ needs.version.outputs.channel }}' == stable ]]; then
+            stem="noma-v${{ needs.version.outputs.version }}-aarch64-apple-darwin"
+          else
+            # A fixed name keeps /releases/download/nightly/<file> working.
+            stem='noma-nightly-aarch64-apple-darwin'
+          fi
+          echo "stem=$stem" >> "$GITHUB_OUTPUT"
+
+          stage="$RUNNER_TEMP/$stem"
+          mkdir -p "$stage"
+
+          cp target/release/noma "$stage/"
+
+          # Vendored in this repo, so take them from source rather than
+          # trusting the build script - see the Windows job for why. The
+          # unversioned libonnxruntime.dylib symlink is deliberately not
+          # shipped: noma's Mach-O load command resolves to the versioned
+          # name below regardless (confirmed with otool -L), so shipping the
+          # symlink would only double the onnxruntime payload for nothing.
+          cp vendor/sherpa-onnx/lib/libsherpa-onnx-c-api.dylib "$stage/"
+          cp vendor/sherpa-onnx/lib/libsherpa-onnx-cxx-api.dylib "$stage/"
+          cp vendor/sherpa-onnx/lib/libonnxruntime.1.17.1.dylib "$stage/"
+          required=(libsherpa-onnx-c-api.dylib libsherpa-onnx-cxx-api.dylib libonnxruntime.1.17.1.dylib)
+          for f in "${required[@]}"; do
+            if [[ ! -e "$stage/$f" ]]; then
+              echo "::error::runtime dylib missing from vendor/sherpa-onnx/lib: $f"
+              exit 1
+            fi
+          done
+
+          cp README.md "$stage/"
+          [[ -f LICENSE ]] && cp LICENSE "$stage/"
+
+          zip="$RUNNER_TEMP/$stem.zip"
+          # ditto, not zip: it is the tool Apple documents for this and
+          # preserves the executable bit without extra flags.
+          ditto -c -k --sequesterRsrc --keepParent "$stage" "$zip"
+          (cd "$RUNNER_TEMP" && shasum -a 256 "$stem.zip") > "$zip.sha256"
+
+          echo "zip=$zip" >> "$GITHUB_OUTPUT"
+          echo "sha=$zip.sha256" >> "$GITHUB_OUTPUT"
+          ls -la "$stage"
+          echo "zip: $(du -h "$zip" | cut -f1)"
+
+      # Every run, including pull requests, gets a downloadable build.
+      - uses: actions/upload-artifact@v7
+        with:
+          name: ${{ steps.meta.outputs.stem }}
+          path: |
+            ${{ steps.meta.outputs.zip }}
+            ${{ steps.meta.outputs.sha }}
+          retention-days: 30
+          if-no-files-found: error
+
+  # One job creates both releases, so the Windows and macOS builds land as two
+  # assets on the same release instead of racing each other to create it -
+  # two jobs both doing `gh release delete nightly && gh release create nightly`
+  # would drop whichever asset lost the race.
+  release:
+    name: release
+    needs: [version, build-windows, build-macos]
+    if: github.event_name == 'push' && (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v'))
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v7
+        with:
+          pattern: "noma-*"
+          path: dist
+          merge-multiple: true
+
+      - run: ls -la dist
 
       # Lane 2: one rolling prerelease that always points at the head of main.
       # Deleted and recreated rather than updated, because a release's tag
       # cannot be moved in place.
       - name: Update the nightly release
-        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
-        shell: pwsh
+        if: github.ref == 'refs/heads/main'
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          $ErrorActionPreference = 'Continue'
-          gh release delete nightly --yes --cleanup-tag 2>$null
-          $ErrorActionPreference = 'Stop'
-          $notes = @"
-          Automatic build of the latest commit on ``main``.
+          set +e
+          gh release delete nightly --yes --cleanup-tag
+          set -euo pipefail
+          notes="Automatic build of the latest commit on \`main\`.
 
           Commit: ${{ github.sha }}
-          Version: ${{ steps.meta.outputs.version }}
+          Version: ${{ needs.version.outputs.version }}
 
-          Unzip anywhere and run ``noma.exe``. The Parakeet model (~465 MB) is
-          downloaded on first launch. This link always points at the newest
-          commit, so it changes without warning - use a tagged release if you
-          want a build that stays put.
-          "@
-          gh release create nightly `
-            --target ${{ github.sha }} `
-            --title "nightly (${{ steps.meta.outputs.version }})" `
-            --notes $notes `
-            --prerelease `
-            --latest=false `
-            "${{ steps.package.outputs.zip }}" "${{ steps.package.outputs.sha }}"
+          Unzip anywhere and run the app for your platform. The Parakeet model
+          (~465 MB) is downloaded on first launch. This link always points at
+          the newest commit, so it changes without warning - use a tagged
+          release if you want a build that stays put."
+          gh release create nightly \
+            --target "${{ github.sha }}" \
+            --title "nightly (${{ needs.version.outputs.version }})" \
+            --notes "$notes" \
+            --prerelease \
+            --latest=false \
+            dist/*
 
       # Lane 3: a real release, created only for a v* tag.
       - name: Publish the tagged release
         if: startsWith(github.ref, 'refs/tags/v')
-        shell: pwsh
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          $ErrorActionPreference = 'Stop'
-          gh release create ${{ github.ref_name }} `
-            --title "Noma ${{ github.ref_name }}" `
-            --generate-notes `
-            --latest `
-            "${{ steps.package.outputs.zip }}" "${{ steps.package.outputs.sha }}"
+          set -euo pipefail
+          gh release create ${{ github.ref_name }} \
+            --title "Noma ${{ github.ref_name }}" \
+            --generate-notes \
+            --latest \
+            dist/*

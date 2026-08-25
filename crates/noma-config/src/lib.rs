@@ -174,7 +174,8 @@ impl Settings {
     }
 }
 
-/// `%APPDATA%\noma` on Windows, `~/.local/share/noma` elsewhere.
+/// `%APPDATA%\noma` on Windows, `~/Library/Application Support/noma` on
+/// macOS, `~/.local/share/noma` on Linux.
 pub fn config_dir() -> Result<PathBuf> {
     let base = dirs::data_dir().ok_or_else(|| anyhow!("no application data directory"))?;
     Ok(base.join("noma"))

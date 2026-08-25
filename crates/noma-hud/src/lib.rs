@@ -224,7 +224,7 @@ impl eframe::App for HudApp {
         };
 
         let show = !matches!(snapshot.0, Phase::Idle);
-        if self.last_shown != Some(show) && place_hud(show) {
+        if self.last_shown != Some(show) && place_hud(show, ctx) {
             self.last_shown = Some(show);
         }
 
@@ -374,7 +374,9 @@ fn open_settings_folder() {
     let _ = std::fs::create_dir_all(&dir);
     #[cfg(windows)]
     let opened = std::process::Command::new("explorer").arg(&dir).spawn();
-    #[cfg(not(windows))]
+    #[cfg(target_os = "macos")]
+    let opened = std::process::Command::new("open").arg(&dir).spawn();
+    #[cfg(not(any(windows, target_os = "macos")))]
     let opened = std::process::Command::new("xdg-open").arg(&dir).spawn();
     if let Err(err) = opened {
         eprintln!("noma: could not open {}: {err}", dir.display());
@@ -382,7 +384,7 @@ fn open_settings_folder() {
 }
 
 #[cfg(windows)]
-fn place_hud(show: bool) -> bool {
+fn place_hud(show: bool, _ctx: &egui::Context) -> bool {
     use windows::Win32::Foundation::RECT;
     use windows::Win32::UI::WindowsAndMessaging::{
         GetWindowRect, SetWindowPos, SystemParametersInfoW, HWND_TOPMOST, SPI_GETWORKAREA,
@@ -530,8 +532,33 @@ fn find_noma_hwnd() -> Option<windows::Win32::Foundation::HWND> {
     }
 }
 
-#[cfg(not(windows))]
-fn place_hud(_show: bool) -> bool {
+/// Move the HUD on screen (centered, near the bottom) or park it off screen.
+///
+/// Unlike Windows, this needs no raw window-server calls for the move itself:
+/// winit already exposes outer-window positioning through egui's
+/// `ViewportCommand`, and `with_transparent(true)` produces genuine per-pixel
+/// transparency on macOS without a DWM-style backdrop to fight. Getting the
+/// screen size still needs one Core Graphics call, though - egui's own
+/// `monitor_size` reports the monitor the window currently sits on, and the
+/// HUD starts parked off every monitor's bounds, so that would report `None`
+/// forever and the HUD would never move on screen the first time it needs to.
+#[cfg(target_os = "macos")]
+fn place_hud(show: bool, ctx: &egui::Context) -> bool {
+    let target = if show {
+        let bounds = core_graphics::display::CGDisplay::main().bounds();
+        Pos2::new(
+            (bounds.size.width as f32 - HUD_WIDTH) / 2.0,
+            bounds.size.height as f32 - HUD_HEIGHT - 48.0,
+        )
+    } else {
+        PARKED
+    };
+    ctx.send_viewport_cmd(ViewportCommand::OuterPosition(target));
+    true
+}
+
+#[cfg(not(any(windows, target_os = "macos")))]
+fn place_hud(_show: bool, _ctx: &egui::Context) -> bool {
     true
 }
 

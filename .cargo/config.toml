@@ -12,3 +12,15 @@
 # how you would point a build at a CUDA or DirectML build of sherpa-onnx.
 [env]
 SHERPA_LIB_PATH = { value = "vendor/sherpa-onnx", relative = true }
+
+# The vendored sherpa-onnx and ONNX Runtime dylibs record their own
+# dependencies as `@rpath/...` rather than an absolute path. Windows resolves
+# a DLL's imports from the executable's own directory automatically; macOS
+# does not do this for @rpath unless the binary carries an LC_RPATH saying so.
+# Without this, noma links and even copies the dylibs next to itself, then
+# fails at process start with "Library not loaded: @rpath/libonnxruntime...".
+[target.x86_64-apple-darwin]
+rustflags = ["-C", "link-args=-Wl,-rpath,@executable_path"]
+
+[target.aarch64-apple-darwin]
+rustflags = ["-C", "link-args=-Wl,-rpath,@executable_path"]

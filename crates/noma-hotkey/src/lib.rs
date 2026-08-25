@@ -63,6 +63,17 @@ pub const KEYS: &[PttKey] = &[
 ];
 
 /// The key Noma binds when settings say nothing useful.
+///
+/// Right Ctrl - the default everywhere else - does not exist as a physical
+/// key on most Mac keyboards (the bottom row is fn/control/option/command,
+/// with no right-hand control key), so it would silently never fire. Right
+/// Alt/Option is on virtually every Mac keyboard and keeps the same
+/// hold-to-talk behavior; Caps Lock is more universal still but toggles
+/// instead of holding on macOS (see `platform::modifier_flag`), which is a
+/// worse first impression for a "hold to talk" app.
+#[cfg(target_os = "macos")]
+pub const DEFAULT_KEY: PttKey = KEYS[1];
+#[cfg(not(target_os = "macos"))]
 pub const DEFAULT_KEY: PttKey = KEYS[0];
 
 /// Look up a key by its settings id.
@@ -242,7 +253,163 @@ mod platform {
     }
 }
 
-#[cfg(not(windows))]
+#[cfg(target_os = "macos")]
+mod platform {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::mpsc::{self, Receiver, Sender};
+    use std::sync::OnceLock;
+    use std::thread;
+    use std::time::{Duration, Instant};
+
+    use anyhow::{anyhow, Context, Result};
+    use core_foundation::runloop::{kCFRunLoopCommonModes, CFRunLoop};
+    use core_graphics::event::{
+        CGEventFlags, CGEventTap, CGEventTapLocation, CGEventTapOptions, CGEventTapPlacement,
+        CGEventType, CallbackResult, EventField,
+    };
+
+    use super::{PttEvent, PttKey, DEFAULT_KEY};
+
+    // Carbon/HIToolbox virtual keycodes, matched against
+    // `EventField::KEYBOARD_EVENT_KEYCODE`. Right Ctrl/Alt/Shift and Caps Lock
+    // are modifier-only keys: physically pressing or releasing one never
+    // produces KeyDown/KeyUp, only FlagsChanged with the matching bit toggled.
+    // F13 is a plain key and arrives as ordinary KeyDown/KeyUp.
+    const KC_RIGHT_CONTROL: i64 = 0x3E;
+    const KC_RIGHT_OPTION: i64 = 0x3D;
+    const KC_RIGHT_SHIFT: i64 = 0x3C;
+    const KC_CAPS_LOCK: i64 = 0x39;
+    const KC_F13: i64 = 0x69;
+
+    fn macos_keycode(key: PttKey) -> i64 {
+        match key.id {
+            "right-ctrl" => KC_RIGHT_CONTROL,
+            "right-alt" => KC_RIGHT_OPTION,
+            "right-shift" => KC_RIGHT_SHIFT,
+            "caps-lock" => KC_CAPS_LOCK,
+            "f13" => KC_F13,
+            other => unreachable!("every PttKey needs a macOS keycode, got {other:?}"),
+        }
+    }
+
+    /// The device-independent flag a modifier key toggles, or `None` for a
+    /// plain key that reports through ordinary KeyDown/KeyUp instead.
+    fn modifier_flag(key: PttKey) -> Option<CGEventFlags> {
+        match key.id {
+            "right-ctrl" => Some(CGEventFlags::CGEventFlagControl),
+            "right-alt" => Some(CGEventFlags::CGEventFlagAlternate),
+            "right-shift" => Some(CGEventFlags::CGEventFlagShift),
+            "caps-lock" => Some(CGEventFlags::CGEventFlagAlphaShift),
+            _ => None,
+        }
+    }
+
+    static KEY: OnceLock<PttKey> = OnceLock::new();
+    static DOWN: AtomicBool = AtomicBool::new(false);
+
+    pub fn active_key() -> PttKey {
+        KEY.get().copied().unwrap_or(DEFAULT_KEY)
+    }
+
+    pub fn spawn(key: PttKey) -> Result<Receiver<PttEvent>> {
+        KEY.set(key).map_err(|_| anyhow!("PTT key already bound"))?;
+        let (tx, rx) = mpsc::channel();
+        let (ready_tx, ready_rx) = mpsc::channel();
+
+        thread::Builder::new()
+            .name("noma-hotkey".into())
+            .spawn(move || {
+                let tap = match install(tx, key) {
+                    Ok(tap) => tap,
+                    Err(err) => {
+                        let _ = ready_tx.send(Err(err));
+                        return;
+                    }
+                };
+                let _ = ready_tx.send(Ok(()));
+                // The tap only fires on the thread that runs its run loop.
+                CFRunLoop::run_current();
+                drop(tap);
+            })
+            .context("spawn hotkey thread")?;
+
+        ready_rx
+            .recv()
+            .context("hotkey thread exited before ready")??;
+        Ok(rx)
+    }
+
+    fn install(tx: Sender<PttEvent>, key: PttKey) -> Result<CGEventTap<'static>> {
+        let keycode = macos_keycode(key);
+        let flag = modifier_flag(key);
+
+        let tap = CGEventTap::new(
+            CGEventTapLocation::HID,
+            CGEventTapPlacement::HeadInsertEventTap,
+            CGEventTapOptions::Default,
+            vec![
+                CGEventType::KeyDown,
+                CGEventType::KeyUp,
+                CGEventType::FlagsChanged,
+            ],
+            move |_proxy, etype, event| {
+                let code = event.get_integer_value_field(EventField::KEYBOARD_EVENT_KEYCODE);
+                if code == keycode {
+                    let is_down = match (etype, flag) {
+                        (CGEventType::FlagsChanged, Some(flag)) => {
+                            event.get_flags().contains(flag)
+                        }
+                        (CGEventType::KeyDown, None) => true,
+                        (CGEventType::KeyUp, None) => false,
+                        _ => return CallbackResult::Keep,
+                    };
+                    emit(&tx, is_down);
+                    return CallbackResult::Drop;
+                }
+                CallbackResult::Keep
+            },
+        )
+        .map_err(|()| {
+            anyhow!(
+                "could not install the hold-to-talk listener - grant Noma Accessibility \
+                 access in System Settings > Privacy & Security > Accessibility, then restart it"
+            )
+        })?;
+
+        let loop_source = tap
+            .mach_port()
+            .create_runloop_source(0)
+            .map_err(|()| anyhow!("create hotkey run loop source"))?;
+        CFRunLoop::get_current().add_source(&loop_source, unsafe { kCFRunLoopCommonModes });
+        tap.enable();
+        Ok(tap)
+    }
+
+    pub fn wait_until_released(timeout: Duration) {
+        let deadline = Instant::now() + timeout;
+        while Instant::now() < deadline {
+            if !DOWN.load(Ordering::SeqCst) {
+                break;
+            }
+            thread::sleep(Duration::from_millis(8));
+        }
+        thread::sleep(Duration::from_millis(25));
+    }
+
+    fn emit(tx: &Sender<PttEvent>, down: bool) {
+        if down {
+            if !DOWN.swap(true, Ordering::SeqCst) {
+                eprintln!("noma: PTT pressed");
+                let _ = tx.send(PttEvent::Pressed);
+            }
+        } else if DOWN.swap(false, Ordering::SeqCst) {
+            eprintln!("noma: PTT released");
+            let _ = tx.send(PttEvent::Released);
+        }
+    }
+}
+
+#[cfg(not(any(windows, target_os = "macos")))]
 mod platform {
     use std::sync::mpsc::Receiver;
     use std::time::Duration;
@@ -256,7 +423,7 @@ mod platform {
     }
 
     pub fn spawn(_key: PttKey) -> Result<Receiver<PttEvent>> {
-        bail!("Noma's hold-to-talk listener currently supports Windows only");
+        bail!("Noma's hold-to-talk listener currently supports Windows and macOS only");
     }
 
     pub fn wait_until_released(timeout: Duration) {
@@ -286,9 +453,8 @@ mod tests {
     }
 
     #[test]
-    fn an_unknown_id_falls_back_to_right_ctrl() {
+    fn an_unknown_id_falls_back_to_the_default_key() {
         assert!(key_from_id("left-ctrl").is_none());
         assert_eq!(key_or_default("left-ctrl"), DEFAULT_KEY);
-        assert_eq!(DEFAULT_KEY.label, "Right Ctrl");
     }
 }
